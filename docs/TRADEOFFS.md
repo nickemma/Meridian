@@ -1,97 +1,161 @@
 # Meridian Tradeoffs
 
-**Purpose:** Every major design decision, what was rejected, and why.
+**Purpose:** Every major design decision in the combined system — what was rejected and why.
 **Last Updated:** April 2026
 
 ---
 
 ## Why Document Tradeoffs?
 
-Every distributed system is a collection of tradeoffs. The CAP theorem is not a constraint you work around — it is a constraint you choose. Strong consistency means unavailability during partitions, by definition. Eventual consistency means stale reads, by design. Causal consistency means the client carries state (the vector clock) and the system must enforce causality, at a performance cost. Understanding which tradeoff was made, and why, is what separates a distributed systems engineer from someone who has deployed distributed systems.
+Every distributed system is a collection of tradeoffs. A secrets management platform built on a distributed store is a collection of two systems' worth of tradeoffs — and the interaction between them creates a third set that neither system would face alone. The CAP theorem is not a constraint you work around; it is a constraint you choose. Strong consistency for secret writes means unavailability during partitions, by definition. WASM sandboxing for policy evaluation means additional per-request overhead, by design. An ML anomaly detector means a false positive rate you must accept and tune, by necessity.
+
+Understanding which tradeoff was made and why is what separates a distributed systems engineer from someone who has deployed distributed systems.
 
 ---
 
 ## Strong Consistency: Correctness vs. Availability
 
-**Chosen:** Raft-based strong consistency via quorum reads and writes
-**Alternative considered:** Multi-Paxos, single-leader reads without quorum confirmation
+**Chosen:** Raft-based strong consistency via quorum reads and writes (read index protocol)
+**Alternative considered:** Multi-Paxos, single-leader reads without quorum confirmation, leader leases
 
-Strong consistency via Raft means that during a network partition, the minority partition cannot serve reads or writes. This is not a bug — it is the definition of strong consistency under CAP. A system that claims strong consistency but serves reads from a partitioned minority is not strongly consistent. Meridian makes this explicit: the minority partition returns `QUORUM_UNAVAILABLE` on strong reads and writes.
+Strong consistency via Raft means that during a network partition, the minority partition cannot serve reads or writes on the strong path. This is not a bug — it is the definition of strong consistency under CAP. For secrets management specifically, this is the only acceptable behavior. A credential served from a partitioned minority that has missed a rotation event may be stale in a security-critical way: the old credential may have been revoked, or rotated after a compromise. The `QUORUM_UNAVAILABLE` error is actionable. A silently wrong credential is a security incident.
 
-The read index protocol is the specific implementation decision that makes strong reads correct. Without it, a partitioned leader could serve reads from its local state after the partition has caused a new leader to be elected in the majority partition. Two leaders serving concurrent reads with different values is a linearizability violation. The read index protocol requires the leader to confirm its leadership (via a heartbeat round-trip to a quorum) before serving a read. This adds one network round-trip to every strong read.
+The read index protocol is the implementation decision that makes strong reads correct. Without it, a partitioned leader could serve reads from local state after a new leader has been elected in the majority partition. The read index protocol requires the leader to confirm its leadership via a heartbeat round-trip to a quorum before serving any read. This adds one network round-trip to every strong read.
 
-Many systems optimize this with leader leases (the leader assumes it is the leader for a bounded time period and serves reads locally). Meridian does not implement leader leases in v1 — they require bounded clock drift guarantees, and without hardware-level clock synchronization (like Spanner's TrueTime), the bound is hard to enforce. The read index protocol is slower but correct under any clock behavior.
+Leader leases — where the leader assumes it remains leader for a bounded time window and serves reads without a confirmation round-trip — were evaluated and rejected for v1. Leases require bounded clock drift guarantees. Without hardware-level clock synchronization equivalent to Spanner's TrueTime, the bound cannot be enforced reliably. A clock skew event could cause a lapsed leader to serve reads it should not serve. For a generic KV store, this risk might be acceptable. For a secrets platform, it is not.
 
 ---
 
-## Causal Consistency: Semantic Power vs. Client Complexity
+## Causal Consistency: Lease Renewals and Policy Reads
 
 **Chosen:** Vector clocks with last-write-wins conflict resolution
 **Alternative considered:** Lamport timestamps, hybrid logical clocks, CRDTs
 
-Causal consistency with vector clocks is the strongest consistency model available without a central coordinator. It guarantees that if you read a value, any subsequent write you make will be visible to anyone who reads your write. It does not guarantee that concurrent writes are handled in any particular way — that requires application-level conflict resolution.
+Causal consistency with vector clocks is used for two operations in Meridian: lease renewals and policy reads. Both share the same requirement — the client needs a causally consistent view of prior writes (the prior lease, the prior policy version) without paying for a full quorum round-trip on every access.
 
-Lamport timestamps provide a total order over events, which sounds stronger, but they do not capture causality precisely. Two events with Lamport timestamps T and T+1 may not be causally related — T+1 may have happened on a completely unrelated code path. Vector clocks capture the actual causal relationship, not just a total order.
+Lamport timestamps provide a total order over events but do not capture causality precisely. Two events with timestamps T and T+1 may be entirely unrelated. Vector clocks capture the actual causal relationship.
 
-Hybrid logical clocks (HLC) combine physical time with logical counters to provide both causality and a close approximation of wall clock time. They are useful when you need to query "what was the state at time T?" — something pure vector clocks cannot answer. HLCs are a v2 consideration when geo-distributed read routing requires timestamp-based consistency.
+Hybrid logical clocks (HLC) combine physical time with logical counters, enabling timestamp-based queries ("what was the policy version at time T?"). This is a v2 consideration when geo-distributed policy reads require timestamp-anchored consistency. For v1, vector clocks are simpler and sufficient.
 
-CRDTs (Conflict-free Replicated Data Types) handle concurrent writes without conflict — data structures like sets, counters, and maps that can always be merged. They are the correct solution when the application semantics require merge rather than overwrite. Last-write-wins is incorrect for a shopping cart (concurrent adds should merge) but correct for a configuration value (the most recent configuration wins). Meridian uses LWW in v1 because it is simpler to implement correctly and covers the most common use cases. CRDTs are a documented extension point.
+CRDTs were evaluated for the conflict resolution strategy. Last-write-wins is incorrect for some data types — a shopping cart should merge concurrent additions rather than overwrite. For secrets and leases, LWW is correct: the most recent credential version wins; the most recent lease renewal wins. CRDTs add complexity without benefit for these access patterns and are documented as a v2 extension for application-layer data.
 
-The client complexity cost of causal consistency is real: clients must carry and propagate the vector clock. This is not optional — a client that does not propagate its vector clock cannot make causal reads. The gRPC API makes this explicit: the `vector_clock` field in causal requests is required, not optional.
+The client complexity cost of causal consistency is real — clients must carry and propagate the vector clock. The gRPC API makes this explicit: the `vector_clock` field in causal requests is required, not optional. This is intentional. A client that does not propagate its vector clock cannot make causal reads.
 
 ---
 
-## Eventual Consistency: Availability vs. Staleness
+## Eventual Consistency: Cached Credential Reads
 
-**Chosen:** Async gossip replication with stale-read acknowledgment
+**Chosen:** Async gossip replication, stale reads explicitly flagged
 **Alternative considered:** Tunable staleness window, read repair
 
-The eventual consistency path in Meridian is deliberately weak: any node serves any read from its local state, regardless of how far behind the leader it is. Writes on the eventual path are applied locally and replicated asynchronously. There is no staleness bound in v1.
+The eventual consistency path is used for one specific pattern: a sidecar agent doing a cached credential refresh, where the service already holds the credential and is proactively refreshing before expiry. In this context, a slightly stale read is acceptable — the service already has the credential and is not making an authorization decision based on this read.
 
-A tunable staleness window (serve reads only if the node is within N seconds of the leader) adds complexity without solving the fundamental problem. If the window is 5 seconds, a partitioned node that has been isolated for 6 seconds must reject reads — at which point the availability advantage of eventual consistency disappears. The choice is between eventual (stale but always available) and bounded-staleness (slightly less stale, sometimes unavailable). Both are valid; Meridian implements eventual in v1 and documents bounded-staleness as a v2 extension.
+A tunable staleness window (serve eventual reads only if the node is within N seconds of the leader) adds complexity without solving the fundamental problem. If the staleness window is exceeded during a partition, the node must reject reads — eliminating the availability advantage of the eventual path. Meridian implements pure eventual for v1 and documents bounded staleness as a v2 extension.
 
-Stale reads are flagged: eventual consistency responses include a `STALE_READ: true` header when the serving node's state is behind the leader's commit index. Clients that cannot tolerate stale reads know to retry with strong consistency. This is a better developer experience than silently returning stale data.
+Stale reads are never silent. Every eventual response includes `STALE_READ: true` when the serving node is behind the leader's commit index. A client that receives `STALE_READ: true` and cannot tolerate staleness knows to retry with strong consistency. This is a better developer experience than silently returning a potentially stale credential.
 
-Read repair (updating a stale node's value when a client reads from it with a fresh value from another node) is an optimization that improves convergence speed. It is a v2 optimization — in v1, convergence is handled entirely by the gossip replication layer.
+One important constraint on the eventual path for secrets: lease validation is not relaxed. An expired lease is rejected even on the eventual path. The lease expiry event is committed through Raft and applied to all nodes before taking effect — a node behind the commit index applies pending log entries (including the expiry event) before serving eventual reads for the affected key.
+
+---
+
+## Secret Rotation: Atomic Log Entry vs. Two-Step Write
+
+**Chosen:** Single atomic Raft log entry for the rotation (new version + current pointer update + revocation schedule)
+**Alternative considered:** Two-step write (version then pointer), distributed transaction, saga pattern
+
+The two-step write approach — write the new version, then update the current pointer — creates a window where the system is in a partially-rotated state. If the leader crashes between the two writes, the cluster is left with an inconsistent view of which version is current. This is not a theoretical concern; it is the failure mode that happens in practice under chaos.
+
+A distributed transaction (two-phase commit) across the two writes was considered. 2PC adds coordinator complexity and a blocking commit phase that reduces availability — the opposite of what a secrets platform needs during a rotation.
+
+The saga pattern — compensating transactions that undo a partial rotation — was evaluated. A saga that fails mid-way must execute a compensating action (roll back to the old version). Rollback logic under partition is complex: the rollback write may also fail to reach quorum, leaving the rollback itself in a partial state.
+
+The single atomic log entry is the correct solution because Raft's state machine semantics guarantee: either the entire entry is applied on a node, or none of it is. There is no partial application. The rotation is not split across multiple log entries. The window of inconsistency is zero.
+
+---
+
+## WASM Policy Sandbox vs. In-Process Evaluation
+
+**Chosen:** WASM sandbox via wasmtime with fuel-based termination
+**Alternative considered:** In-process Go interpreter, OPA (Open Policy Agent) as a sidecar, Lua embedding
+
+In-process Go evaluation (a reflection-based rule engine or an interpreted DSL) is fast but provides no isolation. A malformed policy — one that panics, loops infinitely, or allocates aggressively — can degrade or crash the node. For a platform that runs beneath everything else, a policy-induced node crash is unacceptable. If Meridian goes down, nothing can authenticate.
+
+OPA as a sidecar process was considered. OPA is battle-tested and production-proven. The reasons for the custom WASM implementation: the portfolio goal is to demonstrate policy engine architecture, not OPA deployment. An embedded policy engine also eliminates a network hop on the evaluation path and removes a failure dependency — a Meridian node does not fail policy evaluations because its OPA sidecar is unreachable.
+
+Lua embedding was considered. Lua is a widely-used embedded scripting language with reasonable isolation properties. However, Lua does not have the WASM ecosystem's standardized isolation guarantees, and the compiled WASM artifact is more portable for policy distribution across heterogeneous nodes.
+
+The fuel model was chosen over a goroutine-based timer for terminating runaway policies. A goroutine timer can be bypassed by a WASM module that avoids yielding to the Go scheduler. Wasmtime's fuel model is enforced at the instruction level — the WASM runtime counts instructions and terminates the instance at the budget boundary, regardless of scheduling behavior.
+
+The tradeoff: WASM evaluation has a higher fixed overhead than in-process evaluation. The target p99 of 2ms for policy evaluation accepts this overhead. The isolation guarantee is worth the latency.
 
 ---
 
 ## Rust for the Storage Engine
 
-**Chosen:** Rust LSM implementation
-**Alternative considered:** RocksDB (via cgo FFI), BadgerDB (Go), custom Go LSM
+**Chosen:** Custom Rust LSM implementation
+**Alternative considered:** RocksDB (via cgo FFI), BadgerDB (Go), BoltDB (Go)
 
-The storage engine is the write hot path. Every Raft commit, every eventual consistency write, every snapshot writes through the storage engine. At high throughput — thousands of writes per second — GC pauses in Go become write latency spikes. A distributed KV store that produces periodic write latency spikes under load is not a reliable primitive for the applications built on top of it.
+The storage engine is the write hot path for every secret write, lease update, audit record, and Raft log entry. At high throughput, GC pauses in Go produce write latency spikes. A secrets platform with periodic write latency spikes is not a reliable primitive for the services built on top of it.
 
-RocksDB via cgo FFI would be correct — RocksDB is battle-tested and used in production by CockroachDB, TiKV, and many others. The reason for the custom Rust implementation: the portfolio goal is to demonstrate mastery of the storage engine internals, not to demonstrate the ability to configure RocksDB. A custom LSM implementation shows understanding of memtable design, SSTable format, bloom filter sizing, compaction strategy selection, and WAL format. Configuring RocksDB shows familiarity with its knobs. These are different skills, and for a portfolio demonstrating distributed systems depth, the custom implementation is the correct choice.
+RocksDB via cgo FFI would be correct — RocksDB is battle-tested and used by CockroachDB, TiKV, and many others. The reason for the custom Rust implementation: the portfolio goal is to demonstrate storage engine internals. A custom LSM shows understanding of memtable design, SSTable format, bloom filter sizing, compaction strategy selection, and WAL format. Configuring RocksDB knobs demonstrates familiarity with a specific library. These are different skills, and for a project demonstrating distributed systems depth, the custom implementation is the correct choice.
 
-The tradeoff: the custom Rust LSM will have bugs that RocksDB does not have. This is accepted — the bugs are found by the chaos suite and the linearizability checker, which is exactly the purpose of those components.
+BadgerDB and BoltDB are Go-native and eliminate the cgo boundary, but they share the GC problem on the write path. BadgerDB uses an LSM-like structure but is not as tunable. BoltDB is a B-tree, which trades write amplification for better read characteristics than an LSM — incorrect for a write-heavy secrets platform.
+
+The accepted tradeoff: the custom Rust LSM will have bugs that RocksDB does not have. These bugs are caught by the chaos suite and the linearizability checker, which is exactly the purpose of those components.
+
+---
+
+## ML Anomaly Detection: Embedded vs. External
+
+**Chosen:** Lightweight embedded Go model with per-identity behavioral baseline
+**Alternative considered:** External ML service (Python, TensorFlow Serving), statistical outlier detection only, no anomaly detection
+
+An external ML service introduces a network dependency on every secret access. If the anomaly detection service is unavailable, Meridian must either deny all requests (too restrictive) or bypass detection (defeats the purpose). Neither is acceptable for a platform that must be highly available.
+
+The embedded model is deliberately simple: per-feature deviation scoring with configurable weights. This is not a sophisticated ML model — it is a practical anomaly detection mechanism that operates with no external dependency, bounded memory, and bounded CPU per evaluation. Sophistication is not the goal. Catching behavioral anomalies — a new source IP CIDR, off-hours access, a path not previously accessed — is the goal, and the simple model achieves it.
+
+The false positive rate is a real concern. A system that denies legitimate access because it looks anomalous is worse than no anomaly detection. The two-mode design (alert vs. enforce) addresses this: operators run in alert mode first, tune the thresholds using the Prometheus metrics, and enable enforce mode when confident in the baseline. This is not a theoretical consideration — it is the operational workflow, and it is documented in the runbook.
+
+Statistical outlier detection only (without ML) was considered. A pure statistical approach (z-score on access frequency, IP range checks) misses behavioral patterns that require multi-feature reasoning. The ML baseline is not much more complex to implement but captures correlations the statistical approach cannot.
 
 ---
 
 ## Chaos Suite: Destructiveness vs. Safety
 
 **Chosen:** Destructive chaos in isolated Docker network, never run against real infrastructure
-**Alternative considered:** Fault injection via library hooks, chaos in unit tests
+**Alternative considered:** Fault injection via library hooks, chaos in unit tests, mock network partitions
 
-The chaos suite uses actual iptables network manipulation, actual SIGKILL process termination, and actual system clock modification. These are the same mechanisms that cause real failures in production. A chaos suite that simulates failures via mock injection does not test the same code paths that production failures exercise.
+The chaos suite uses actual iptables network manipulation, actual SIGKILL process termination, and actual system clock modification. These are the same mechanisms that cause real failures in production. A chaos suite that simulates failures via mock injection does not test the same code paths as real failures.
 
-The isolation constraint — chaos runs only in an isolated Docker network, never against any real infrastructure — is enforced at the network level, not by convention. The Docker network has no external routes. The chaos orchestrator explicitly verifies it is running in an isolated environment before executing any destructive operation. Running the chaos suite against a real cluster by accident is a network-level impossibility, not just a documented warning.
+The isolation constraint is enforced at the network level: the Docker network has no external routes. The chaos orchestrator verifies it is running in an isolated environment before executing any destructive operation. Running the chaos suite against a real cluster by accident is a network-level impossibility, not a documented warning that can be ignored.
 
-The Python chaos orchestrator is deliberately separate from the Go node implementation. Chaos must be independent from the system under test — a chaos framework embedded in the node code cannot kill the node process or simulate network partitions at the OS level.
+The Python chaos orchestrator is separate from the Go node implementation. Chaos must be independent from the system under test — an embedded chaos framework cannot SIGKILL its own process or manipulate iptables at the OS level without affecting the system it is testing.
+
+---
+
+## Tamper-Evident Audit Log: Hash Chain vs. Signed Records
+
+**Chosen:** SHA-256 hash chain (each record hashes the previous)
+**Alternative considered:** Per-record HMAC signing, Merkle tree audit log, external append-only log service
+
+Per-record HMAC signing (each record is independently signed with a cluster key) provides tamper evidence per record but does not detect insertion or deletion — a record can be removed from the sequence without breaking any individual record's signature. The hash chain detects any modification, insertion, or deletion because a gap or change in the sequence breaks the chain from that point forward.
+
+A Merkle tree audit log provides efficient membership proofs — an auditor can verify that a specific record is in the log without downloading the entire log. This is a v2 consideration when compliance requirements demand efficient third-party auditing. For v1, the full chain verification is sufficient.
+
+An external append-only log service (a cloud logging backend with append-only guarantees) introduces an external dependency that creates a failure mode — if the external service is unavailable, audit records cannot be written. Meridian's audit log is committed through Raft, so it is only unavailable when the cluster itself is unavailable. The audit log failure mode is the same as the secrets failure mode.
 
 ---
 
 ## Pre-Vote vs. Standard Raft Election
 
-**Chosen:** Pre-vote extension
+**Chosen:** Pre-vote extension (Ongaro dissertation, not original paper)
 **Alternative considered:** Standard Raft election
 
-The pre-vote optimization was described in Ongaro's PhD dissertation (not the original Raft paper). Without it, a partitioned node that repeatedly times out and increments its term can disrupt a stable cluster when it reconnects — the higher term causes the current leader to step down unnecessarily, triggering a re-election.
+Without pre-vote, a node that was partitioned for an extended period accumulates a high term from repeated failed elections. When it reconnects, its higher term causes the current leader to step down unnecessarily — a disruption to a stable cluster serving live secret requests.
 
-Pre-vote prevents this by requiring a node to confirm it could win an election before starting one. The node asks peers "would you vote for me?" without incrementing the term. If it cannot get a pre-vote majority, it does not start the election. The partitioned node's disruption is contained.
+Pre-vote prevents this by requiring a node to confirm it could win an election before starting one. If it cannot get a pre-vote majority, it does not increment the term and does not start the election.
 
-The tradeoff: pre-vote adds one extra message round-trip to every election. Under normal operation, elections are rare (only when the leader fails). The additional latency per election is negligible compared to the stability benefit.
+The tradeoff: pre-vote adds one extra message round-trip to every election. Under normal operation, elections are rare — only when the leader fails. The additional latency is negligible compared to the stability benefit. For a secrets platform where leader transitions affect all in-flight secret requests, stability is worth a single extra round-trip.
 
 ---
 
@@ -100,8 +164,12 @@ The tradeoff: pre-vote adds one extra message round-trip to every election. Unde
 | Decision | Chosen | Alternative | Core Reason |
 |---|---|---|---|
 | Strong consistency | Raft quorum reads (read index) | Leader lease | Read index is correct under any clock behavior; leases require clock bounds |
-| Causal consistency | Vector clocks + LWW | HLC, CRDTs | Vector clocks capture causality precisely; LWW covers most use cases |
-| Eventual consistency | Async gossip, stale-flagged reads | Bounded staleness | Simpler; staleness is acknowledged, not hidden |
-| Storage engine | Custom Rust LSM | RocksDB, BadgerDB | Portfolio goal: demonstrate storage internals, not configuration |
-| Chaos suite | Destructive, OS-level, isolated Docker | Mock injection, unit test faults | Same mechanisms as real failures; isolation prevents accidents |
-| Election protocol | Pre-vote + standard Raft | Standard Raft only | Pre-vote prevents disruption from partitioned nodes reconnecting |
+| Secret rotation | Single atomic log entry | Two-step write, 2PC, saga | Zero window of inconsistency; Raft state machine semantics guarantee atomicity |
+| Causal consistency | Vector clocks + LWW | HLC, CRDTs | Vector clocks capture causality; LWW correct for secrets and leases |
+| Eventual consistency | Async gossip, stale-flagged | Bounded staleness | Simpler; staleness is acknowledged, not hidden; leases still validated |
+| Policy sandbox | WASM + wasmtime + fuel model | In-process Go, OPA sidecar | Isolation without network hop; fuel model prevents runaway policies |
+| Anomaly detection | Embedded Go ML, per-identity baseline | External service, pure statistics | No external dependency; operational failure mode matches cluster failure mode |
+| Audit log | SHA-256 hash chain, Raft-committed | HMAC per record, Merkle tree | Chain detects insertion/deletion; Raft-committed matches cluster availability |
+| Storage engine | Custom Rust LSM | RocksDB, BadgerDB | Demonstrates storage internals; no GC on write path |
+| Chaos suite | Destructive, OS-level, isolated Docker | Mock injection | Same mechanisms as real failures; isolation is enforced, not documented |
+| Election protocol | Pre-vote + standard Raft | Standard Raft only | Prevents partitioned node from disrupting stable cluster |
