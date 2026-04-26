@@ -8,7 +8,9 @@
 
 ## Purpose
 
-This document explains the hard problems in Meridian — the places where distributed systems theory becomes distributed systems engineering. It covers the Raft log replication protocol in implementation detail, the vector clock merge algorithm and why it handles concurrency correctly, quorum calculation under partial failure (including the non-obvious cases), and the chaos suite design. These are not descriptions of how Raft works in principle. They are descriptions of how Meridian implements it and where the implementation decisions diverge from the naive reading of the paper.
+This document explains the hard problems in Meridian — the places where distributed systems theory becomes distributed systems engineering. It covers the Raft log replication protocol in implementation detail, the vector clock merge algorithm and why it handles concurrency correctly, quorum calculation under partial failure (including the non-obvious cases), and the chaos suite design. It also covers the problems that are unique to the combined system: the secret rotation protocol and why it requires a single atomic log entry, the WASM policy evaluation sandbox and its fuel-based termination model, and the audit log hash chain and how it survives snapshot compaction.
+
+These are not descriptions of how things work in principle. They are descriptions of how Meridian implements them and where the implementation decisions diverge from the naive reading of the underlying papers.
 
 ---
 
@@ -16,13 +18,13 @@ This document explains the hard problems in Meridian — the places where distri
 
 ### What the paper says vs. what you actually implement
 
-The Raft paper is the clearest consensus protocol paper written. It is still not a complete implementation specification. The paper describes the algorithm and its safety invariants. It does not describe the practical decisions that every implementation must make: how large should AppendEntries batches be, what happens when a follower's log has entries beyond the leader's commit index, how do you handle the case where a candidate wins an election with a log that is behind the previous leader's committed entries.
+The Raft paper is the clearest consensus protocol paper written. It is still not a complete implementation specification. It describes the algorithm and its safety invariants. It does not describe the practical decisions that every implementation must make: how large should AppendEntries batches be, what happens when a follower's log has entries beyond the leader's commit index, how do you handle the case where a candidate wins an election with a log behind the previous leader's committed entries.
 
 Meridian's Raft implementation makes these decisions explicitly.
 
 ### AppendEntries batching
 
-Sending one AppendEntries RPC per log entry would serialize all replication — the leader waits for each RPC to complete before sending the next. Instead, the leader batches all pending log entries (up to a configurable maximum) into a single AppendEntries RPC per peer. The batch size is bounded by `MERIDIAN_RAFT_MAX_BATCH_ENTRIES` (default 100 entries) to prevent large RPCs from blocking the network.
+Sending one AppendEntries RPC per log entry serializes all replication. Instead, the leader batches all pending log entries (up to `MERIDIAN_RAFT_MAX_BATCH_ENTRIES`, default 100) into a single RPC per peer. Each peer has a dedicated replication goroutine. Goroutines are independent — a slow follower does not block replication to a fast follower. The leader tracks `nextIndex` and `matchIndex` per peer independently.
 
 ```
 Write arrives at leader
@@ -36,47 +38,85 @@ Write arrives at leader
               └─ Send AppendEntries(entries=[...]) to peer
 ```
 
-Each peer has a dedicated replication goroutine. Goroutines are independent — a slow follower does not block replication to a fast follower. The leader tracks the `nextIndex` and `matchIndex` per peer independently.
-
 ### Log divergence after leader failure
 
-The subtlest correctness property in Raft: when a new leader is elected, followers may have log entries that the new leader does not have. These entries were appended by the old leader but never committed (the old leader was partitioned before they reached quorum).
-
-The new leader handles this through the `nextIndex` probe:
+When a new leader is elected, followers may have log entries the new leader does not have — appended by the old leader but never committed before it was partitioned. The new leader handles this through the `nextIndex` probe:
 
 ```
 New leader elected
   │
-  ├─ Initialize nextIndex[peer] = leader.lastLogIndex + 1 for all peers
+  ├─ Initialize nextIndex[peer] = leader.lastLogIndex + 1
   │
-  └─ AppendEntries to peer fails (log mismatch at nextIndex - 1)
+  └─ AppendEntries to peer fails (log mismatch)
       │
       └─ Decrement nextIndex[peer]
           │
-          └─ Retry AppendEntries at lower index
+          └─ Retry at lower index
               │
-              └─ Repeat until peer's log matches at nextIndex - 1
+              └─ Repeat until log matches at nextIndex - 1
                   │
-                  └─ Send all entries from nextIndex[peer] onward
-                      (this overwrites the peer's uncommitted entries)
+                  └─ Send all entries from nextIndex onward
+                     (overwrites peer's uncommitted entries)
 ```
 
-The safety guarantee: entries can only be overwritten if they were never committed. Raft's election restriction (a candidate cannot win an election unless its log is at least as up-to-date as any committed entry in the cluster) ensures the new leader's log contains all committed entries.
+The safety guarantee: entries can only be overwritten if they were never committed. Raft's election restriction ensures the new leader's log contains all committed entries.
 
-### The election restriction (election safety in practice)
+### The election restriction
 
-A node votes for a candidate only if the candidate's log is at least as up-to-date as its own. "At least as up-to-date" is defined by the paper as:
+A node votes for a candidate only if the candidate's log is at least as up-to-date as its own:
 
-1. If the logs have different last terms, the log with the higher last term is more up-to-date
-2. If the logs have the same last term, the longer log is more up-to-date
+1. If the logs have different last terms, the log with the higher last term wins
+2. If the logs have the same last term, the longer log wins
 
-This restriction is what prevents a candidate with a stale log from becoming leader and overwriting committed entries. It is the single most important safety property in Raft, and it is easy to implement incorrectly by checking only the log length and not the term of the last entry.
+This is the single most important safety property in Raft. It is easy to implement incorrectly by checking only the log length and not the term of the last entry.
 
 ### Pre-vote optimization
 
-Meridian implements the pre-vote extension from the Raft dissertation. Without pre-vote, a node that was partitioned for an extended period accumulates a high term from repeated failed elections. When it reconnects, it disrupts the stable cluster with a higher term — causing the current leader to step down unnecessarily.
+Meridian implements the pre-vote extension from the Raft dissertation. Without it, a partitioned node that repeatedly times out accumulates a high term. When it reconnects, it causes the current leader to step down unnecessarily — a disruption to a stable cluster.
 
-Pre-vote adds a phase before a candidate actually starts an election: it asks peers if they would vote for it in a real election without incrementing the term. If it cannot get a quorum of pre-votes, it does not start the election. The partitioned node's disruption is contained.
+Pre-vote adds a phase before the candidate increments the term: it asks peers "would you vote for me?" without starting a real election. If it cannot get a quorum of pre-votes, it does not start the election. The disruption is contained.
+
+---
+
+## Secret Rotation Protocol
+
+### The problem: two-step writes under partition
+
+A naive rotation implementation makes two sequential writes: write the new secret version, then update the `current` pointer to point to it. If the leader crashes between these two writes, the cluster ends up with a new version in storage but the `current` pointer still pointing to the old version. When the cluster recovers, the new version exists but is unreachable without knowing its version identifier.
+
+Worse: if the `current` pointer update reaches a quorum but the new version write does not, the pointer refers to a version that does not exist on all nodes.
+
+### The solution: atomic log entry
+
+The rotation protocol packages both writes — the new version entry and the `current` pointer update — into a single Raft log entry:
+
+```
+Rotation log entry (index=1042, term=7):
+  writes:
+    - key: secret:services/payments/db-password:v5
+      value: {ciphertext, created_at, ttl, rotation_schedule}
+    - key: secret:services/payments/db-password:current
+      value: {version: "v5", valid_until: <grace_period_end>}
+    - key: secret:services/payments/db-password:v4:revocation
+      value: {scheduled_at: <now>, effective_at: <grace_period_end>}
+```
+
+Either all three writes are applied — committed to a quorum and applied to the state machine — or none are. There is no intermediate state visible to any reader.
+
+### Grace period and revocation
+
+When a rotation commits, the old version is not immediately revoked. Services holding leases issued against the old version have a grace period (default 5 minutes, configurable) to renew their lease against the new version. After the grace period, the revocation event is a committed Raft entry — the old version is rejected cluster-wide, on every node, at the same committed index.
+
+A service holding an expired lease for the old version after the grace period cannot read the old credential from any node — not from the leader, not from a follower, not from a node that missed the revocation event (such a node is behind the commit index and will apply the revocation before serving any eventual reads, because lease expiry validation checks the local commit state before serving even eventual reads).
+
+### Rotation under leader failover
+
+If the leader dies mid-rotation, the log entry is either committed or not:
+
+- **Not committed (did not reach quorum before crash):** the new leader is elected from the majority. The rotation entry is absent from the majority log. Raft's log divergence repair overwrites the entry on any follower that received it from the old leader. The rotation did not happen. The client receives an error and retries.
+- **Committed (reached quorum before crash):** the entry is in the majority log. The new leader applies it as part of log replay. The rotation completed correctly. The client may not have received the success response (the old leader crashed before responding) — a retry produces an idempotent result because the version identifier is deterministic.
+
+The chaos suite specifically tests both paths.
 
 ---
 
@@ -84,9 +124,9 @@ Pre-vote adds a phase before a candidate actually starts an election: it asks pe
 
 ### The correctness requirement
 
-A causal consistency guarantee means: if operation A causally precedes operation B (A → B), then any node that has seen B must also have seen A. Vector clocks encode causality: V(A) < V(B) (A's clock is dominated by B's clock componentwise) means A causally precedes B.
+Causal consistency guarantees: if operation A causally precedes operation B (A → B), any node that has seen B must also have seen A. Vector clocks encode this relationship: V(A) < V(B) componentwise means A causally precedes B.
 
-The merge algorithm must preserve this property across concurrent writes from different nodes.
+In Meridian, causal consistency is used for lease renewals and policy reads — operations where the client needs a causally consistent view of prior writes, without paying for quorum.
 
 ### The algorithm
 
@@ -101,45 +141,34 @@ On local write at node i:
 On receiving a write with clock VC_recv from node j:
   for each k in 1..n:
     VC_i[k] = max(VC_i[k], VC_recv[k])
-  VC_i[j] += 1  (acknowledge the received event)
+  VC_i[j] += 1
   apply the write
 
 Causality check (is A causally before B?):
-  A → B if and only if:
-    VC_A[k] ≤ VC_B[k] for all k, AND
-    VC_A[k] < VC_B[k] for at least one k
+  A → B iff VC_A[k] ≤ VC_B[k] for all k
+          AND VC_A[k] < VC_B[k] for at least one k
 
 Concurrent writes (neither precedes the other):
-  NOT (A → B) AND NOT (B → A)
-  i.e., VC_A[j] > VC_B[j] for some j AND VC_B[k] > VC_A[k] for some k
+  VC_A[j] > VC_B[j] for some j
+  AND VC_B[k] > VC_A[k] for some k
 ```
 
-### Conflict resolution for concurrent writes
+### Conflict resolution
 
-When two writes to the same key are concurrent (neither vector clock dominates the other), both are valid from a causality standpoint. Meridian must apply one. The resolution policy in v1:
-
-1. Compare wall clock timestamps — later timestamp wins
-2. If timestamps are equal (within 1ms), the write from the higher node ID wins
-
-This is last-write-wins (LWW). It is the correct choice for a portfolio project and for most practical use cases. It is not the correct choice for all use cases — a shopping cart that needs to merge concurrent additions rather than overwrite them would need CRDTs (Conflict-free Replicated Data Types). CRDTs are a v2 concern. LWW is documented, not hidden.
-
-Every conflict is logged: the two concurrent writes, the winning write, and the resolution reason. The conflict log is queryable. Operators can audit how often concurrent writes occur and whether LWW is producing correct results for their use case.
+Concurrent writes to the same key are resolved via last-write-wins: later wall clock timestamp wins, with node ID as tiebreaker on equal timestamps. Every conflict is logged — the two concurrent writes, the winning write, and the resolution reason. Conflicts are never silent.
 
 ### Causal read protocol
 
 ```
-Client requests Get("x", CAUSAL, client_vc=[2,1,0])
+Client: GetLease(lease_id, CAUSAL, client_vc=[4,3,2])
 
 At the serving node:
-  ├─ Check local VC: is local_vc ≥ client_vc componentwise?
+  ├─ Is local_vc ≥ client_vc componentwise?
   │   ├─ Yes → read from local storage, return value + local_vc
   │   └─ No  → this node hasn't seen all events the client has seen
-  │            └─ Option 1: wait for replication to catch up (bounded wait)
-  │               Option 2: return CAUSAL_NOT_SATISFIED error
-  │               Meridian uses Option 2 with a bounded retry in the client library
+  │            └─ Return CAUSAL_NOT_SATISFIED
+  │               Client retries with exponential backoff
 ```
-
-The causal read guarantee: if a client previously wrote or read at VC=[2,1,0], any subsequent causal read will see a state that includes at least those events. The client's vector clock is the causality token — it is the client's responsibility to pass it between reads and writes.
 
 ---
 
@@ -147,65 +176,135 @@ The causal read guarantee: if a client previously wrote or read at VC=[2,1,0], a
 
 ### The standard case
 
-For N=3: quorum = 2. One node can fail. Two nodes continue serving strong reads and writes.
-
-For N=5: quorum = 3. Two nodes can fail. Three nodes continue serving.
-
-This is well-understood. The non-obvious cases are the ones the chaos suite tests.
+For N=3: quorum=2. One node can fail. For N=5: quorum=3. Two nodes can fail.
 
 ### Asymmetric partition
 
 ```
 3-node cluster: Node1, Node2, Node3
 
-Partition: Node1 ↔ Node2 can communicate
-           Node1 ↔ Node3 can communicate
-           Node2 → Node3 BLOCKED (asymmetric)
+Partition: Node2 → Node3: BLOCKED (asymmetric, one direction)
 
-From Node1's perspective: can reach Node2 AND Node3 → quorum exists, Node1 can be leader
-From Node2's perspective: can reach Node1, cannot reach Node3 → can reach quorum with Node1
-From Node3's perspective: can reach Node1, cannot reach Node2 → can reach quorum with Node1
+Node1 can reach both Node2 and Node3 → Node1 can be leader (quorum exists)
+Node2 can reach Node1 → can reach quorum with Node1
+Node3 can reach Node1 → can reach quorum with Node1
 
-Result: Node1 remains leader (or any node with visibility to majority)
-        The partition does not cause a split — Node1 bridges both sides
-
-This is correct behavior. Raft's majority quorum handles asymmetric partitions.
+Result: Node1 bridges both sides. No split. Correct behavior.
 ```
 
-### Split-brain scenario (the dangerous case)
+### Split-brain protection
 
 ```
-5-node cluster partitioned into two groups:
-  Partition A: Node1, Node2 (2 nodes — cannot form quorum)
-  Partition B: Node3, Node4, Node5 (3 nodes — can form quorum)
+5-node cluster: Partition A (Node1, Node2), Partition B (Node3, Node4, Node5)
 
-Partition B elects a new leader (higher term) — correct
-Partition A cannot elect a leader (no quorum) — correct
+Partition B: 3 nodes — can form quorum → elects new leader (higher term)
+Partition A: 2 nodes — cannot form quorum → cannot elect leader
 
-BUT: if the original leader was in Partition A and does NOT know it's partitioned,
-     it may continue accepting writes from clients it can still reach.
-
-Meridian's protection: the leader's heartbeat round-trips to a majority of peers.
-If the leader cannot get heartbeat ACKs from a majority, it steps down.
-There is no scenario where Meridian allows two leaders to coexist in the same term.
+The original leader (in Partition A) cannot get heartbeat ACKs from a majority.
+It steps down. There is no scenario where two leaders coexist in the same term.
 ```
 
-### The false quorum risk
+The step-down is the key: Meridian's leader requires majority heartbeat ACKs on an ongoing basis. A partitioned leader that cannot reach the majority steps down within one election timeout. It does not continue accepting secret writes. Any writes it accepted before stepping down that did not reach quorum are not committed.
 
-In a 5-node cluster with 2 simultaneous node failures (tolerated), if the remaining 3 nodes are asymmetrically partitioned such that no single node can reach the other 2:
+### What partition means for secrets specifically
+
+A service trying to fetch a credential from the minority partition on the strong path receives `QUORUM_UNAVAILABLE`. This is the correct answer. A secrets manager that returns a potentially stale or incorrect credential during a partition is more dangerous than one that returns an error. The error is actionable — retry against a node in the majority. The wrong credential is silent data corruption.
+
+A service fetching on the eventual path gets the most recent locally-known credential version with `STALE_READ: true`. This is appropriate for cached reads where the service already holds the credential and is refreshing proactively.
+
+---
+
+## WASM Policy Evaluation Sandbox
+
+### Why WASM
+
+Policy evaluation is on the critical path — every secret read and write goes through it. The policy runtime must be fast, isolated, and unable to affect the node process regardless of policy content.
+
+In-process evaluation (a Go interpreter or reflection-based rule engine) is fast but not isolated. A policy with an infinite loop, a panic-inducing expression, or memory-hungry data structures can degrade or crash the node. For a platform that runs beneath everything else, this is unacceptable.
+
+WASM provides OS-process-level isolation without OS-process-level overhead. A WASM module that panics cannot affect the host. A WASM module that loops indefinitely is terminated when it exhausts its fuel budget. A WASM module that allocates excessive memory is bounded by the WASM linear memory limit.
+
+### The fuel model
+
+Wasmtime's fuel model assigns a budget of computational instructions to each WASM invocation. When the budget is exhausted, the WASM instance is terminated and the evaluation returns `POLICY_TIMEOUT`. The fuel budget is calibrated to the target p99 evaluation latency (2ms) — a policy that exceeds the budget by 10x cannot use more than 10x the target time.
+
+The fuel model is preferable to a goroutine-based timer because it is deterministic and cannot be bypassed by a WASM module that avoids yielding to the Go scheduler.
+
+### Policy compilation pipeline
 
 ```
-Node3 → Node4: BLOCKED
-Node3 → Node5: BLOCKED
-Node4 → Node5: BLOCKED
-(Each node can only reach itself — no quorum possible)
-
-Result: cluster becomes fully unavailable for strong writes
-        Eventual reads continue from local state on each node
-
-This is correct. 3 simultaneous failures exceed the cluster's fault tolerance.
-Meridian reports QUORUM_UNAVAILABLE, not a silently wrong answer.
+Policy source (Rego-inspired DSL)
+  │
+  ↓
+Parser → AST
+  │
+  ↓
+Type checker (catches type errors before deployment)
+  │
+  ↓
+WASM compiler (DSL → WASM bytecode)
+  │
+  ↓
+Validation (WASM module is valid, memory limits are set, no forbidden imports)
+  │
+  ↓
+Storage (policy KV entry committed through Raft)
+  │
+  ↓
+Distribution (policy propagated to all nodes via Raft log replication)
 ```
+
+All nodes evaluate from the same compiled WASM bytecode stored in the Raft log. Policy is not compiled on each node separately — the compiled artifact is the authoritative version. A policy update that fails compilation is rejected before it reaches the Raft log.
+
+### Policy evaluation under partition
+
+During a partition, the minority partition evaluates policy against its local policy version. A policy update committed to the majority partition during the partition is not visible to the minority until healing. This is the correct behavior — the minority's policy version is stale, but it is the most recent version the minority has confirmed as committed. After healing, the minority receives the policy update via log replication and applies it.
+
+The partition does not cause a policy version split where different nodes permanently disagree on policy — Raft's log replication guarantees convergence after healing.
+
+---
+
+## Audit Log Hash Chain
+
+### Structure
+
+Each audit record contains a hash of the previous record:
+
+```
+Record 0 (genesis):
+  prev_hash: "0000...0000" (null genesis hash)
+  hash:      sha256(record_0_content || prev_hash)
+
+Record 1:
+  prev_hash: sha256(record_0)
+  hash:      sha256(record_1_content || prev_hash)
+
+Record N:
+  prev_hash: sha256(record_N-1)
+  hash:      sha256(record_N_content || prev_hash)
+```
+
+To tamper with Record K, an attacker must recompute the hashes for all records from K through the current record. The current record's hash is committed through Raft and known to all nodes. Any recomputation produces a different hash for the current record — the tampering is detectable by any node.
+
+### Survival through snapshot compaction
+
+When the Raft log is compacted into a snapshot, the audit records up to the snapshot index are included in the snapshot. The snapshot contains the full audit record sequence (not just the final hash) — an auditor can recompute the chain from genesis through the snapshot.
+
+The snapshot's audit sequence ends with a "snapshot boundary" record whose hash becomes the `prev_hash` for the first post-snapshot audit record. The chain is continuous across snapshot boundaries.
+
+```
+Records 0-9000: in snapshot
+  Snapshot boundary record:
+    index:     9000
+    prev_hash: sha256(record_9000)
+    hash:      sha256(snapshot_boundary || prev_hash)
+
+Record 9001 (post-snapshot):
+  prev_hash: sha256(snapshot_boundary)
+  hash:      sha256(record_9001_content || prev_hash)
+```
+
+Verification runs in two phases: verify the in-snapshot chain from genesis to the snapshot boundary, then verify the post-snapshot chain from the boundary to the current record.
 
 ---
 
@@ -213,53 +312,66 @@ Meridian reports QUORUM_UNAVAILABLE, not a silently wrong answer.
 
 ### Design principle
 
-The chaos suite is not a test that runs once to check if the system starts up. It is an adversarial agent that continuously destroys the cluster while the linearizability checker verifies that the system's behavior under destruction is still consistent with its stated guarantees. The chaos suite passes when the system is provably correct under the tested failure scenarios. It fails when the system produces a history that cannot be explained by a valid linearizable execution.
+The chaos suite is an adversarial agent that continuously destroys the cluster while the linearizability checker verifies that the system's behavior is consistent with its stated guarantees. It passes when correctness is provably maintained under the tested failure scenarios. It fails when the system produces a history that cannot be explained by a valid linearizable execution.
 
-### Chaos scenarios implemented
+In the combined system, the chaos suite adds scenarios that no generic KV store chaos suite covers: secret access under partition, rotation under leader failover, policy enforcement under partition, and anomaly detection under access pattern injection.
+
+### Chaos scenarios
 
 **Node kill (SIGKILL):**
-1. Start 3-node cluster, run writes on all nodes simultaneously
-2. SIGKILL a random follower
-3. Verify the remaining 2 nodes continue serving (majority intact)
-4. Restart the killed node
-5. Verify it rejoins, catches up via log replication, and serves correctly
-6. SIGKILL the leader
-7. Verify a new leader is elected within 5 seconds
-8. Verify no committed writes are lost after the leader restart
+- Start 3-node cluster, run secret reads and writes simultaneously
+- SIGKILL a random follower — verify cluster continues serving
+- Restart the killed node — verify it rejoins, catches up, and serves correctly
+- SIGKILL the leader — verify new leader elected within 5 seconds, no committed writes lost
 
-**Network partition (iptables):**
-1. Run concurrent writes from clients to all nodes
-2. Partition the cluster 2+1 (majority + minority)
-3. Verify: majority partition continues strong writes, minority rejects strong writes
-4. Verify: minority partition serves stale eventual reads, flagged as stale
-5. Heal the partition
-6. Verify the minority node converges to the majority's state
-7. Run the linearizability checker on the full operation history
+**Network partition (iptables) — core:**
+- Partition 2+1; verify majority serves strong writes, minority rejects strong reads with `QUORUM_UNAVAILABLE`
+- Verify minority serves eventual reads with `STALE_READ: true`
+- Heal partition; verify minority converges; run linearizability checker
+
+**Secret access under partition:**
+- Service holds a valid lease for credential version v4
+- Partition cluster 2+1; service is on the minority side
+- Service attempts strong read — receives `QUORUM_UNAVAILABLE` (correct)
+- Service attempts eventual read — receives v4 with `STALE_READ: true` (correct)
+- Majority rotates the credential to v5 during partition
+- Heal partition; verify minority applies the rotation; verify the service's next strong read returns v5; verify the v4 lease is now expired (past grace period)
+
+**Rotation under leader failover:**
+- Begin rotation of a credential (single atomic log entry in flight)
+- SIGKILL the leader before the AppendEntries RPC reaches quorum
+- Verify new leader is elected; verify rotation is absent from majority log
+- Verify client receives error; retry rotation — succeeds on second attempt
+- Repeat with the leader killed after AppendEntries reaches quorum — verify rotation is committed correctly on new leader
+
+**Policy enforcement under partition:**
+- Upload a policy that allows access only from 10.0.0.0/8
+- Partition cluster; update policy to also allow 192.168.0.0/16 on majority
+- Verify minority still evaluates old policy (correct — it has not seen the update)
+- Heal partition — verify minority applies updated policy via log replication
+- Verify a 192.168.x.x source is denied on minority before healing, allowed after
+
+**Anomaly injection:**
+- Service `payments-service` establishes baseline over 100 accesses (normal hours, normal IPs)
+- Inject access from a new IP CIDR not in the baseline — verify anomaly score exceeds threshold
+- In enforce mode: verify the access is denied and the denial is in the audit log with the score
+- In alert mode: verify the access is allowed, the score is emitted as a Prometheus metric, the audit record includes the score
 
 **Clock skew injection:**
-1. Advance system time on a follower by +5 minutes
-2. Verify vector clock causality is not violated (vector clocks are logical, not physical — but physical timestamps used for LWW conflict resolution must be handled correctly)
-3. Verify Raft election timeouts are not prematurely triggered by clock skew
-4. Retard system time on the leader by -2 minutes
-5. Verify the leader does not step down due to perceived election timeout
-
-**Concurrent write storm:**
-1. Fire 1000 concurrent writes to random keys from 10 clients simultaneously
-2. Half writes to the leader (strong consistency), half to followers (eventual consistency)
-3. After writes complete, query all keys from all nodes
-4. Verify strong-consistency writes are present on all nodes
-5. Verify eventual-consistency writes converged within the replication window
-6. Run the linearizability checker on the strong-consistency writes
+- Advance system time on a follower by +5 minutes
+- Verify vector clock causality is not violated (vector clocks are logical — clock skew does not affect them)
+- Verify LWW conflict resolution with skewed wall clock is logged with an anomaly note
+- Retard leader clock by -2 minutes — verify Raft election stability is not affected
 
 ### Linearizability checker algorithm
 
-The checker collects an operation history H: a sequence of (key, op, value, start_time, end_time, node) tuples. It verifies H is linearizable by checking whether there exists a sequential history S that:
+The checker collects an operation history H: a sequence of (key, op, value, start_time, end_time, node) tuples. It verifies H is linearizable by checking whether a sequential history S exists that:
 
 1. Contains exactly the operations in H
-2. Preserves the real-time ordering of H (if op A finishes before op B starts, A appears before B in S)
+2. Preserves real-time ordering (if op A finishes before op B starts, A precedes B in S)
 3. Is consistent with the KV store specification (each read returns the value of the most recent preceding write for that key in S)
 
-The search uses the Wing-Gong algorithm with early termination when a valid S is found. For concurrent operations (overlapping time ranges), the checker enumerates possible orderings. The search is bounded by the number of concurrent operations — the chaos suite limits concurrency to keep the checker tractable.
+The Wing-Gong algorithm with P-compositionality optimization runs per-key histories in parallel. The chaos suite limits concurrency to keep the search tractable. The 30-minute full battery run is the exit criterion for Phase 8.
 
 ---
 
@@ -270,13 +382,13 @@ The search uses the Wing-Gong algorithm with early termination when a valid S is
 ```
 Write arrives
   │
-  ├─ Append to WAL (fsync — durability guarantee)
+  ├─ Append to WAL (AES-256-GCM, fsync — durability guarantee)
   ├─ Insert into memtable (BTreeMap — in-memory sorted)
   │
   └─ If memtable size > threshold (default 64MB):
       ├─ Freeze current memtable (immutable)
       ├─ Start new empty memtable
-      └─ Flush frozen memtable to SSTable on disk (background goroutine)
+      └─ Flush frozen memtable to SSTable (background goroutine)
 ```
 
 ### Read path
@@ -286,21 +398,34 @@ Read arrives
   │
   ├─ Check memtable (most recent writes, O(log n))
   ├─ If not found: check each SSTable, newest to oldest
-  │   ├─ Check bloom filter: is the key possibly in this SSTable?
+  │   ├─ Check bloom filter — key possibly in this SSTable?
   │   │   └─ No → skip (no disk read)
   │   └─ Yes → binary search SSTable index, read data block
   │
   └─ Return first found value (newest SSTable wins)
 ```
 
-Read amplification: in the worst case, a read checks N SSTables before finding the key (or determining it does not exist). Compaction bounds this by merging old SSTables into fewer, larger ones. The target read amplification is ≤ 4 SSTables per read after compaction.
+Target read amplification: ≤ 4 SSTables per read after compaction.
 
 ### Compaction strategy
 
-Meridian uses leveled compaction (same as RocksDB default). SSTables are organized into levels (L0, L1, L2, ...). L0 is written by memtable flushes. When L0 reaches a threshold number of files, they are compacted into L1. When L1 reaches a size threshold, a file is picked and merged with overlapping files in L2. And so on.
+Meridian uses leveled compaction. SSTables are organized into levels (L0, L1, L2, ...). L0 is written by memtable flushes. When L0 reaches a threshold, files are compacted into L1. When L1 reaches size, a file is merged with overlapping L2 files, and so on.
 
-Leveled compaction bounds read amplification (each level has sorted, non-overlapping key ranges — at most one file per level needs to be read for any key) at the cost of higher write amplification (files are rewritten multiple times as they move through levels). For a KV store where reads matter as much as writes, leveled compaction is the correct choice.
+Leveled compaction bounds read amplification (at most one file per level needs to be read for any key) at the cost of higher write amplification. For a secrets platform where reads are on the critical path, bounded read amplification is the correct trade.
 
 ### WAL encryption
 
-The WAL is encrypted using AES-256-GCM with a key from `MERIDIAN_WAL_ENCRYPTION_KEY`. Each WAL record is a separately encrypted block — the encryption overhead is per-record, not per-byte, so the cost is bounded by the number of writes, not their size. The encryption key is never stored on disk — it is provided at node startup.
+Each WAL record is encrypted separately with AES-256-GCM. The key is provided at node startup via `MERIDIAN_WAL_ENCRYPTION_KEY` and is never stored on disk. The encryption overhead is per-record, not per-byte — bounded by write count, not write volume.
+
+---
+
+## References
+
+- [Architecture](ARCHITECTURE.md) — system map, component responsibilities, end-to-end consistency flows
+- [Tradeoffs](TRADEOFFS.md) — strong vs causal vs eventual, WASM sandbox vs in-process, ML anomaly detection model choice
+- [Runbook](RUNBOOK.md) — operational procedures for every failure mode described here
+- [Raft paper](https://raft.github.io/raft.pdf) — Ongaro & Ousterhout
+- [Vector clocks](https://lamport.azurewebsites.net/pubs/time-clocks.pdf) — Lamport
+- [Linearizability](https://cs.brown.edu/~mph/HerlihyW90/p463-herlihy.pdf) — Herlihy & Wing
+- [WebAssembly spec](https://webassembly.github.io/spec/) — for the WASM sandbox implementation
+- [Wasmtime](https://wasmtime.dev/) — the WASM runtime used for policy evaluation
