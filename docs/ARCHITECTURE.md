@@ -8,52 +8,67 @@
 
 ## Overview
 
-Meridian is a distributed key-value store built to prove one thing: that CAP theorem is not an abstract constraint — it is a set of engineering decisions with measurable consequences. Every component in Meridian represents one of those decisions. Raft consensus implements CP — consistency and partition tolerance, at the cost of availability during splits. The eventual consistency path implements AP — availability and partition tolerance, at the cost of stale reads. Causal consistency with vector clocks sits between them — stronger than eventual, weaker than strong, with specific semantics that the client can reason about.
+Meridian is a geo-distributed key-value store and secrets management platform built under a single architectural constraint: **every guarantee the consensus engine provides must translate directly into a guarantee the secrets layer can make to its clients.**
 
-The central design constraint is this: **each consistency level must be implemented correctly, or the system is not useful — it is deceptive.** A system that claims to provide strong consistency but allows dirty reads under partition is worse than a system that makes no consistency guarantee at all. Every component in Meridian is built under the constraint that its consistency semantics must be mathematically verifiable by the chaos suite.
+Strong consistency via Raft means that a rotated credential is visible to all nodes in the majority partition before the old version is revoked — there is no window where two versions are simultaneously valid across a split. Partition tolerance means that a network partition produces an explicit, typed error on the strong path and an explicitly-flagged stale read on the eventual path — not a silent wrong answer. Tunable consistency means that a sidecar agent doing a cached credential read does not pay the cost of a quorum round-trip every time, because the consistency model is a per-request decision, not a cluster-wide setting.
+
+The central design constraint: **each layer must be implemented correctly, or the system is not useful — it is deceptive.** A secrets manager that claims strong consistency but allows stale credential reads under partition is worse than one that makes no consistency guarantee at all. Every component in Meridian is built under the constraint that its guarantees are mathematically verifiable by the chaos suite.
 
 ---
 
 ## System Map
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Client Layer                              │
-│        gRPC API  •  Consistency level per request               │
-│        Strong  |  Causal  |  Eventual                           │
-└─────────────────────────────────────────────────────────────────┘
-                               ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                    Meridian Node (Go)                            │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐ │
-│  │   Request   │  │  Consistency│  │     Vector Clock        │ │
-│  │   Router    │  │  Resolver   │  │     Manager             │ │
-│  └─────────────┘  └─────────────┘  └─────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-                               ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                   Raft Consensus Layer (Go)                      │
-│  Leader Election  •  Log Replication  •  Commit  •  Snapshot    │
-└─────────────────────────────────────────────────────────────────┘
-                               ↓
-┌────────────────────────────────────────────────────────────────┐
-│    ┌──────────────────────┐   ┌─────────────────────────┐     │
-│    │   Storage Engine      │   │   Replication Layer     │    │
-│    │   (Rust)              │   │   (Go)                  │    │
-│    │   LSM  WAL  SSTables  │   │   Async gossip          │    │
-│    └──────────────────────┘   └─────────────────────────┘     │
-└────────────────────────────────────────────────────────────────┘
-                               ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                     Cluster (3-5 nodes)                          │
-│    Node 1 (Leader)  •  Node 2 (Follower)  •  Node 3 (Follower) │
-│              mTLS between all nodes                              │
-└─────────────────────────────────────────────────────────────────┘
-                               ↓
-┌─────────────────────────────────────────────────────────────────┐
-│              Chaos Orchestrator + Verifier (Python)              │
-│   Node kills  •  Partitions  •  Clock skew  •  Linearizability  │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Client Layer                                 │
+│   gRPC API  •  Secret fetch  •  Policy check  •  Lease renewal      │
+│   Consistency level per request: Strong | Causal | Eventual         │
+└─────────────────────────────────────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Meridian Node (Go)                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌───────────────────────────┐ │
+│  │   Request    │  │  Consistency │  │     Vector Clock          │ │
+│  │   Router     │  │  Resolver    │  │     Manager               │ │
+│  └──────────────┘  └──────────────┘  └───────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Secrets & Policy Layer (Go)                       │
+│  ┌───────────────┐  ┌───────────────┐  ┌──────────────────────┐   │
+│  │  Secret Store │  │ Policy Engine │  │  Anomaly Detector    │   │
+│  │  + Rotation   │  │ (WASM sandbox)│  │  (ML model, Go)      │   │
+│  └───────────────┘  └───────────────┘  └──────────────────────┘   │
+│  ┌───────────────┐  ┌───────────────┐                              │
+│  │  Lease Manager│  │  Audit Engine │                              │
+│  │               │  │  (append-only)│                              │
+│  └───────────────┘  └───────────────┘                              │
+└─────────────────────────────────────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Raft Consensus Layer (Go)                          │
+│   Leader Election  •  Log Replication  •  Commit  •  Snapshot        │
+└─────────────────────────────────────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│   ┌───────────────────────┐   ┌──────────────────────────────┐     │
+│   │    Storage Engine     │   │      Replication Layer       │     │
+│   │       (Rust)          │   │          (Go)                │     │
+│   │  LSM  •  WAL  •  SSTables │   │  Async gossip            │    │
+│   └───────────────────────┘   └──────────────────────────────┘     │
+└─────────────────────────────────────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                       Cluster (3–5 nodes)                            │
+│   Node 1 (Leader)  •  Node 2 (Follower)  •  Node 3 (Follower)      │
+│                  mTLS between all nodes                              │
+└─────────────────────────────────────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│               Chaos Orchestrator + Verifier (Python)                 │
+│   Node kills  •  Partitions  •  Clock skew  •  Linearizability      │
+│   Secret access under partition  •  Policy enforcement under chaos   │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -62,21 +77,111 @@ The central design constraint is this: **each consistency level must be implemen
 
 ### Request Router (Go)
 
-The entry point for all client requests. Inspects the requested consistency level and routes accordingly:
+The entry point for all client requests — both raw KV operations and secrets API calls. Inspects the requested consistency level and routes accordingly:
 
 - `STRONG` → Raft consensus layer (all writes and reads go through the leader)
 - `CAUSAL` → Vector clock manager + storage (reads return the value at or after the client's vector clock)
 - `EVENTUAL` → Local storage read (any node serves directly from its local state)
 
-The router is stateless. It does not make consistency decisions — it delegates to the component responsible for each consistency model.
+For secrets API requests, the router additionally:
+- Extracts the service identity from the mTLS certificate presented by the client
+- Invokes the policy engine before any storage read or write — a request that fails policy evaluation never reaches the storage layer
+- Records every decision in the audit engine, regardless of outcome
+
+The router is stateless. It does not make consistency decisions or policy decisions — it delegates to the component responsible for each concern.
+
+### Secret Store (Go)
+
+Sits above the consensus layer. Every secret is stored as a structured KV entry with a versioned path:
+
+```
+Key:   secret:<path>:<version>
+Value: {ciphertext, created_at, created_by, ttl, rotation_schedule, metadata}
+
+Key:   secret:<path>:current
+Value: {version: "v4", valid_until: <timestamp>}
+```
+
+The `current` pointer is a strongly consistent write. Rotation atomically updates the `current` pointer to the new version and schedules the old version for revocation after the grace period. Both writes — the new version entry and the `current` pointer update — go through Raft in a single log entry. There is no two-step window where the pointer update can be separated from the version creation by a crash.
+
+Secret values are encrypted with a per-secret DEK (data encryption key). The DEK is wrapped with a cluster-level KEK (key encryption key) stored in a sealed keyring. The plaintext DEK never touches disk.
+
+### Policy Engine (Go + WASM)
+
+Evaluates access policy for every secret request. Policies are written in a Rego-inspired DSL, compiled to WebAssembly at upload time, and evaluated in a wasmtime sandbox on the read path.
+
+The WASM sandbox is the critical design decision. A policy that panics, loops indefinitely, or attempts to access memory outside its sandbox cannot affect the node process. The evaluation timeout is enforced at the WASM fuel level — not by a goroutine timer that can be bypassed. A policy that exceeds its fuel budget is terminated and the request is denied.
+
+Every policy evaluation receives the full request context:
+```json
+{
+  "identity":        "payments-service",
+  "path":            "services/payments/db-password",
+  "action":          "read",
+  "source_ip":       "10.4.2.31",
+  "timestamp":       1712345678,
+  "lease_id":        "lease-abc-123",
+  "access_history":  { "last_access": 1712342000, "access_count_24h": 47 }
+}
+```
+
+Policy evaluation is synchronous and on the critical path. Target latency p99 < 2ms for any policy that fits within the fuel budget.
+
+### Anomaly Detector (Go)
+
+A lightweight ML model embedded in the node process — no external service dependency. Builds a per-identity behavioral baseline from the access history stored in the audit log.
+
+The baseline captures: access time-of-day distribution, source IP CIDR ranges, secret path access patterns, access frequency. A new access is scored against the baseline. Accesses that deviate significantly from baseline — a new source IP CIDR, access at an unusual hour, a path not previously accessed — produce an anomaly score.
+
+The anomaly detector operates in two modes:
+- **Alert mode** — anomaly scores above threshold are emitted as Prometheus metrics and logged to the audit trail; access is still granted if policy allows
+- **Enforce mode** — anomaly scores above threshold cause the request to be denied; the denial is logged with the anomaly score and the baseline deviation reason
+
+The model is deliberately simple: a per-feature deviation score aggregated with configurable weights. The point is not ML sophistication — it is that anomaly detection is a runtime enforcement concern, not a post-hoc analysis concern, and the architecture reflects that.
+
+### Lease Manager (Go)
+
+Every successful secret access issues a lease — a time-bounded token that authorizes continued access to a secret version without re-running policy evaluation on every read. Leases are tracked as KV entries committed through Raft:
+
+```
+Key:   lease:<lease_id>
+Value: {identity, path, version, issued_at, expires_at, renewable}
+```
+
+A lease that expires is not silently ignored — it is placed on an expiry queue backed by the Raft log. When the expiry event is committed, the lease is no longer valid cluster-wide. A service holding an expired lease must re-authenticate and re-run policy evaluation to get a new one.
+
+Lease renewal is a causal consistency write: the new lease entry causally follows the previous one, and the vector clock ensures the renewal is visible to any node that has seen the previous lease.
+
+### Audit Engine (Go)
+
+An append-only, hash-chained audit log committed through Raft. Every access decision — allow or deny, with full context — is an audit record:
+
+```
+Record N:
+  event:        secret_access_allowed
+  identity:     payments-service
+  path:         services/payments/db-password
+  version:      v4
+  consistency:  strong
+  lease_id:     lease-abc-123
+  timestamp:    1712345678
+  policy:       payments-policy-v2
+  anomaly_score: 0.12
+  prev_hash:    sha256(Record N-1)
+  hash:         sha256(this record)
+```
+
+The hash chain means a record cannot be modified or deleted without invalidating all subsequent records. An operator running `meridian-cli audit verify` recomputes the chain from genesis — any break is reported with the index and the two records involved.
+
+Because audit records are committed through Raft, the audit log is consistent across the cluster. An auditor querying any node gets the same history — there is no "the log is on the leader" problem.
 
 ### Raft Consensus Layer (Go)
 
-Implements the Raft protocol as described in the Ongaro and Ousterhout paper. Three roles: Leader, Follower, Candidate. Three sub-protocols: leader election, log replication, and membership change.
+Implements the Raft protocol as described in the Ongaro and Ousterhout paper, plus the pre-vote extension from the dissertation. Three roles: Leader, Follower, Candidate. Three sub-protocols: leader election, log replication, and membership change.
 
-**Leader election** — nodes start as followers. If a follower receives no heartbeat within the election timeout (randomized 150-300ms), it becomes a candidate, increments its term, votes for itself, and sends RequestVote RPCs to all peers. If it receives votes from a majority, it becomes leader and begins sending heartbeats. The randomized timeout prevents split votes from cascading.
+**Leader election** — nodes start as followers. If a follower receives no heartbeat within the election timeout (randomized 150–300ms), it becomes a candidate, increments its term, votes for itself, and sends RequestVote RPCs to all peers. If it receives votes from a majority, it becomes leader and begins sending heartbeats. The randomized timeout prevents split votes from cascading.
 
-**Log replication** — the leader appends all writes to its log as entries, then sends AppendEntries RPCs to all followers. When a majority of nodes (including the leader) have persisted the entry, it is committed and applied to the state machine. The leader sends the commit index to followers in subsequent heartbeats. Followers apply entries up to the commit index.
+**Log replication** — the leader appends all writes to its log, then sends AppendEntries RPCs to all followers. When a majority of nodes have persisted the entry, it is committed and applied to the state machine. The leader sends the commit index to followers in subsequent heartbeats.
 
 **Safety invariants enforced:**
 - Election safety: at most one leader per term
@@ -86,114 +191,138 @@ Implements the Raft protocol as described in the Ongaro and Ousterhout paper. Th
 
 ### Vector Clock Manager (Go)
 
-Tracks causality for the causal consistency path. Each node maintains a vector clock: an array of logical counters, one per node in the cluster. A write increments the writing node's counter. A read returns both the value and the vector clock at the time of the read. A subsequent causal write includes this clock — the system guarantees that the write is applied after all events that causally precede it.
+Tracks causality for the causal consistency path. Each node maintains a vector clock — an array of logical counters, one per node. A write increments the writing node's counter. A read returns both the value and the vector clock at the time of the read.
+
+Used specifically in Meridian for lease renewals and policy updates — operations where the client must see a causally consistent view of prior state, but where paying for a full quorum round-trip on every access is unnecessary overhead.
 
 ```
-Node 1 writes key "x":    VC = [1, 0, 0]
-Node 2 reads key "x":     VC = [1, 0, 0]
-Node 2 writes key "y"
-  (causally after reading "x"):
-                           VC = [1, 1, 0]
+Node 1 issues lease:       VC = [1, 0, 0]
+Node 2 reads lease:        VC = [1, 0, 0]
+Node 2 renews lease
+  (causally after reading): VC = [1, 1, 0]
 
-Any subsequent read of "y" is guaranteed to see
-the state of "x" that Node 2 saw.
+Any node that has seen the renewal has also seen the original lease.
 ```
-
-Conflict detection: two writes are concurrent if neither vector clock dominates the other (neither is ≤ the other componentwise). Concurrent writes are conflicts. Meridian uses last-write-wins (by wall clock, then node ID as tiebreaker) for conflict resolution in v1. The conflict is logged — the resolution is not silent.
 
 ### Storage Engine (Rust)
 
-An LSM (Log-Structured Merge) tree implementation providing durable, crash-safe storage. Rust earns its place here for the same reason it earns its place in every write-hot path: deterministic latency with no GC, memory safety without runtime overhead, and the ability to control memory layout precisely for SSTable compaction.
+An LSM (Log-Structured Merge) tree providing durable, crash-safe storage. Three components:
 
-Three components:
-- **WAL (Write-Ahead Log)** — every write is appended to the WAL before being applied to the memtable. On crash recovery, the WAL is replayed to reconstruct the memtable.
-- **Memtable** — an in-memory sorted map (BTreeMap in Rust). Writes go here after WAL. When the memtable exceeds its size threshold, it is flushed to an SSTable on disk.
-- **SSTables** — immutable sorted files on disk. Reads check the memtable first, then SSTables from newest to oldest. Bloom filters on each SSTable skip files that cannot contain the key. Background compaction merges SSTables to bound read amplification.
+- **WAL** — every write is appended to the WAL (AES-256-GCM encrypted, fsync on write) before being applied to the memtable. On crash recovery, the WAL is replayed to reconstruct in-memory state.
+- **Memtable** — an in-memory sorted map (BTreeMap). Writes land here after WAL. When the memtable exceeds its size threshold, it is flushed to an SSTable on disk.
+- **SSTables** — immutable sorted files on disk. Reads check the memtable first, then SSTables newest to oldest. Bloom filters skip files that cannot contain the key. Background compaction merges SSTables to bound read amplification.
+
+Rust earns its place here for the same reason it earns its place in every write-hot path: deterministic latency with no GC pauses, memory safety without runtime overhead, and precise control over memory layout for SSTable compaction.
 
 ### Replication Layer (Go)
 
-Handles the eventual consistency path. Async gossip replication between nodes — writes applied locally are propagated to peers in the background without blocking the client. Replication is best-effort: if a node is partitioned, writes buffer up to a configurable limit and are replayed when the partition heals.
+Handles the eventual consistency path. Async gossip replication — writes applied locally are propagated to peers in the background without blocking the client. Replication is best-effort: writes buffer during a partition and are replayed when the partition heals. Eventual reads from a lagging node include `STALE_READ: true` in the response — staleness is acknowledged, not hidden.
 
-The replication layer does not guarantee ordering across nodes in eventual mode. Two writes from different clients to different nodes may be applied in different orders on different replicas. This is the correct behavior for eventual consistency — and it is tested by the chaos suite.
+The replication layer does not guarantee ordering across nodes in eventual mode. This is correct behavior for eventual consistency, and it is specifically tested by the chaos suite.
 
 ### Chaos Orchestrator (Python)
 
-A test harness that actively destroys the cluster to verify correctness. Runs in an isolated Docker network — never against any real infrastructure. Three categories of chaos:
+An adversarial test harness that actively destroys the cluster while correctness is verified. Runs only in an isolated Docker network — this is enforced at the network level, not by convention. Three categories of chaos:
 
-- **Node kills** — SIGKILL a random node, verify the cluster continues serving requests (if majority remains), verify the killed node rejoins and converges after restart
-- **Network partitions** — use Docker network rules (iptables) to isolate nodes or create asymmetric partitions, verify the majority partition continues serving and the minority partition either serves stale reads (eventual) or rejects requests (strong)
-- **Clock skew injection** — advance or retard system time on a node, verify vector clock causality is not violated, verify Raft election timeouts handle clock skew correctly
+- **Node kills** — SIGKILL random nodes, verify cluster continues, verify the killed node rejoins and converges
+- **Network partitions** — Docker iptables rules to isolate nodes; verify majority/minority behavior per consistency level
+- **Clock skew injection** — advance or retard system time; verify vector clock causality is not violated; verify Raft election stability
+
+In the combined system, the chaos suite also runs:
+- **Secret access under partition** — a service tries to fetch a credential while the cluster is partitioned; verify the majority serves, the minority returns the correct error, and no incorrect credential is ever served
+- **Rotation under failover** — a secret rotation is in flight when the leader dies; verify the rotation either completes correctly or rolls back cleanly — no half-rotated state
 
 ### Linearizability Checker (Python)
 
-A Jepsen-style verification tool. Records every operation (key, operation type, value, timestamp, node) during a chaos run. After the run, verifies the operation history is consistent with a linearizable execution — that there exists a total ordering of all operations that is consistent with real time and the single-value constraint.
+A Jepsen-style verification tool. Records every operation (key, type, value, timestamp, node) during a chaos run. After the run, verifies the operation history is consistent with a linearizable execution — that there exists a total ordering consistent with real time and the single-value constraint.
 
-The checker uses the Wing and Gong linearizability algorithm: exhaustive search over possible total orderings, pruned by consistency constraints. For small operation histories (hundreds of operations) this is tractable. For large histories, the checker uses the P-compositionality optimization to check per-key histories independently.
+The checker uses the Wing-Gong linearizability algorithm with P-compositionality optimization for per-key parallel verification of large histories.
 
 ---
 
 ## Consistency Model Per-Request (End-to-End)
 
-### Strong Consistency Write
+### Secret Write (Strong Consistency)
 
 ```
-Client: Put("user:1001", "balance=500", STRONG)
+Service: PutSecret("services/payments/db-password", value, STRONG)
   │
   ↓
-Request Router → Consistency Resolver
-  └─ Level = STRONG → route to Raft leader
+Request Router
+  ├─ Extract identity from mTLS cert: "payments-service"
+  ├─ Policy engine: eval(identity, path, action=write) → ALLOW
+  ├─ Anomaly detector: score = 0.08 (within baseline) → OK
   │
   ↓
-Raft Leader
-  ├─ Append to local log: (index=42, term=3, key=user:1001, value=balance=500)
-  ├─ Send AppendEntries to all followers
-  │   ├─ Node 2: AppendEntries ACK
-  │   └─ Node 3: AppendEntries ACK
-  ├─ Majority received (2 of 2 followers ACKed) → commit index = 42
-  ├─ Apply to storage engine (Rust): put(user:1001, balance=500)
-  └─ Return success to client
-```
-
-### Strong Consistency Read
-
-```
-Client: Get("user:1001", STRONG)
+Secret Store
+  ├─ Encrypt value with per-secret DEK
+  ├─ Generate new version: "v5"
+  ├─ Build log entry: {secret:path:v5 = ciphertext, secret:path:current = v5}
   │
   ↓
 Raft Leader
-  ├─ Read index protocol: record current commit index (42)
-  ├─ Send heartbeat to majority of followers to confirm leadership
-  │   (confirms this node is still leader — not stale from a partition)
-  ├─ Wait for majority heartbeat ACKs
-  ├─ Read from storage engine at commit index ≥ 42
-  └─ Return value to client
+  ├─ Append log entry (index=1042, term=7)
+  ├─ AppendEntries to all followers → majority ACK
+  ├─ Commit index = 1042
+  ├─ Apply to storage engine (Rust)
+  └─ Return success + new version + lease
+
+  └─ Audit Engine records: secret_write_allowed, identity, path, v5, VC, timestamp, hash
 ```
 
-The read index protocol is why strong reads go through the leader and still require a network round-trip. Serving reads from local state without the leadership confirmation would allow a partitioned old leader to return stale data — a linearizability violation.
-
-### Causal Consistency Write
+### Secret Read (Strong Consistency)
 
 ```
-Client: Put("user:1002", "cart=[item1]", CAUSAL, vc=[1,0,0])
+Service: GetSecret("services/payments/db-password", STRONG, lease_id)
+  │
+  ↓
+Request Router
+  ├─ Validate lease_id against lease store (lease still valid? not expired?)
+  ├─ Policy engine: eval(identity, path, action=read) → ALLOW
+  ├─ Anomaly detector: score = 0.11 → OK
+  │
+  ↓
+Raft Leader
+  ├─ Read index protocol: record current commit index (1042)
+  ├─ Heartbeat to majority of followers to confirm leadership
+  ├─ Wait for majority ACK
+  ├─ Read secret:path:current → "v5"
+  ├─ Read secret:path:v5 → ciphertext
+  ├─ Decrypt with DEK
+  └─ Return plaintext + lease renewal
+
+  └─ Audit Engine records: secret_access_allowed, identity, path, v5, strong, score, hash
+```
+
+### Secret Lease Renewal (Causal Consistency)
+
+```
+Service: RenewLease(lease_id, CAUSAL, client_vc=[4,3,2])
   │
   ↓
 Vector Clock Manager
-  ├─ Merge client VC [1,0,0] with local VC [0,1,0]
-  │   result: [1,1,0] (element-wise max)
-  ├─ Increment own component: [1,2,0]
-  ├─ Write to local storage with VC [1,2,0]
-  └─ Async replicate to peers with VC [1,2,0]
+  ├─ Merge client VC [4,3,2] with local VC [4,2,2] → [4,3,2]
+  ├─ Increment own component → [4,4,2]
+  ├─ Write new lease entry with VC [4,4,2]
+  └─ Return new lease + VC [4,4,2] to client
+
+  └─ Any node that has seen this renewal has also seen the original lease issuance.
 ```
 
-### Eventual Consistency Read
+### Secret Read (Eventual Consistency — Cached Sidecar)
 
 ```
-Client: Get("user:1003", EVENTUAL)
+Sidecar: GetSecret("services/payments/db-password", EVENTUAL)
   │
   ↓
-Local storage read — no coordination, no quorum
-  └─ Return whatever the local node has, including potentially stale data
-     (node may be partitioned and behind the leader)
+Local node storage — no quorum, no policy re-evaluation
+  ├─ Read from local state
+  ├─ If node is behind leader commit index: STALE_READ = true
+  └─ Return cached secret + STALE_READ flag + version
+
+  Note: Eventual reads still validate the local lease. An expired lease is rejected
+        even on the eventual path — the expiry event is committed through Raft
+        and applied to all nodes before the expiry window closes.
 ```
 
 ---
@@ -208,12 +337,13 @@ For a cluster of N nodes, Raft requires a quorum of ⌈N/2⌉ + 1 nodes for any 
 | 5 | 3 | 2 |
 | 7 | 4 | 3 |
 
-During a partition, the majority partition continues serving strong consistency reads and writes. The minority partition:
-- **Strong reads/writes:** rejected — the minority cannot reach quorum
-- **Eventual reads:** served from local state — stale but available
-- **Causal reads:** served if the client's vector clock is satisfied by local state
+During a partition, the majority partition continues serving strong reads and writes. The minority partition:
+- **Strong secret reads/writes:** rejected — `QUORUM_UNAVAILABLE`
+- **Eventual reads:** served from local state — stale but available, with `STALE_READ: true`
+- **Lease validation:** expired leases are rejected even on the eventual path (expiry is committed through Raft before taking effect)
+- **Policy evaluation:** runs against the local policy version; a policy update committed during a partition is not visible to the minority until healing
 
-This is CAP theorem in operation. Meridian does not hide the partition from clients — it returns explicit error codes on the strong consistency path when quorum is unreachable, and returns stale data with a `STALE_READ` flag on the eventual path. The client knows what kind of data it is getting.
+Meridian does not hide the partition from clients. Explicit error codes on the strong path. Explicit staleness flags on the eventual path. The client knows exactly what kind of data it is getting.
 
 ---
 
@@ -221,16 +351,16 @@ This is CAP theorem in operation. Meridian does not hide the partition from clie
 
 The Raft log grows unboundedly without compaction. Log compaction in Meridian:
 
-1. The leader takes a snapshot of the current storage engine state at a log index
-2. The snapshot is written to disk (Rust storage engine serializes state)
+1. Leader takes a snapshot of the current storage engine state at a log index
+2. Snapshot is written to disk (Rust storage engine serializes state, including all secret versions and current pointers, lease entries, policy versions, and audit records up to the snapshot index)
 3. All log entries up to the snapshot index are deleted from the Raft log
-4. New followers that join after compaction receive the snapshot instead of replaying the full log
+4. New followers receive the snapshot via streaming gRPC instead of replaying the full log
 
-Snapshot transfer uses a streaming gRPC call — large snapshots are sent in chunks. The follower applies the snapshot atomically: it discards its current state and replaces it with the snapshot. If the transfer is interrupted, the follower retains its previous state and requests the snapshot again.
+The audit log is included in snapshots. An auditor restoring from a snapshot gets the full audit history — the hash chain is preserved and verifiable from genesis through the snapshot index.
 
 ---
 
-## Monorepo Structure
+## Module Structure
 
 ```
 meridian/
@@ -239,22 +369,22 @@ meridian/
 │   └── meridian-cli/         ← Admin + operator CLI
 ├── core/
 │   ├── raft/                 ← Raft state machine, leader election, log replication
-│   ├── router/               ← Per-request consistency level routing
+│   ├── router/               ← Per-request consistency level routing + identity extraction
 │   ├── vectorclock/          ← Vector clock management, merge, conflict detection
 │   ├── replication/          ← Async gossip replication for eventual path
 │   ├── quorum/               ← Quorum calculation, partition detection
 │   └── snapshot/             ← Snapshot creation, streaming transfer
 ├── secrets/
-│   ├── store/                ← Secret CRUD, versioning, encryption
-│   ├── rotation/             ← Automatic rotation scheduler, grace period management
-│   └── lease/                ← Lease issuance, renewal, expiry
+│   ├── store/                ← Secret CRUD, versioning, DEK/KEK encryption
+│   ├── rotation/             ← Rotation scheduler, grace period, revocation
+│   └── lease/                ← Lease issuance, renewal, expiry queue
 ├── policy/
-│   ├── engine/               ← WASM sandbox (wasmtime), policy evaluation
+│   ├── engine/               ← WASM sandbox (wasmtime), fuel-bounded evaluation
 │   ├── compiler/             ← Rego-inspired DSL → WASM compilation
-│   └── store/                ← Policy versioning, rollback (backed by core KV)
+│   └── store/                ← Policy versioning + rollback (backed by core KV)
 ├── observability/
-│   ├── anomaly/              ← ML behavioral baseline, deviation scoring
-│   ├── audit/                ← Hash-chained audit log, Raft-committed entries
+│   ├── anomaly/              ← Per-identity behavioral baseline, deviation scoring
+│   ├── audit/                ← Hash-chained records, Raft-committed, chain verification
 │   └── metrics/              ← Prometheus instrumentation, Grafana dashboard configs
 ├── storage/                  ← Rust LSM storage engine (WAL, memtable, SSTable)
 ├── chaos/                    ← Python chaos orchestrator
@@ -262,20 +392,15 @@ meridian/
 ├── proto/                    ← Protobuf definitions (client API + inter-node)
 ├── docker/                   ← Multi-node cluster docker-compose
 └── docs/
-    ├── ARCHITECTURE.md
-    ├── DESIGN_DOC.md
-    ├── RUNBOOK.md
-    ├── TRADEOFFS.md
-    └── ROADMAP.md
 ```
 
 ---
 
 ## References
 
-- [Design Doc](DESIGN_DOC.md) — Raft log replication deep dive, vector clock merge algorithm, quorum under partial failure, chaos suite design
-- [Tradeoffs](TRADEOFFS.md) — strong vs causal vs eventual, LSM read amplification, chaos suite destructiveness
-- [Runbook](RUNBOOK.md) — split-brain recovery, log divergence repair, snapshot restore
+- [Design Doc](DESIGN_DOC.md) — Raft log replication, vector clock algorithm, quorum under partial failure, chaos suite design, secret rotation protocol, policy evaluation sandbox
+- [Tradeoffs](TRADEOFFS.md) — strong vs causal vs eventual, LSM vs RocksDB, WASM sandbox vs in-process evaluation, ML anomaly detection design
+- [Runbook](RUNBOOK.md) — split-brain recovery, log divergence repair, snapshot restore, secret rotation rollback, audit chain verification
 - [Raft paper](https://raft.github.io/raft.pdf) — Ongaro & Ousterhout
 - [Vector clocks](https://lamport.azurewebsites.net/pubs/time-clocks.pdf) — Lamport, "Time, Clocks, and the Ordering of Events"
 - [Linearizability](https://cs.brown.edu/~mph/HerlihyW90/p463-herlihy.pdf) — Herlihy & Wing
