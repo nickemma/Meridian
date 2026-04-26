@@ -230,27 +230,43 @@ Snapshot transfer uses a streaming gRPC call — large snapshots are sent in chu
 
 ---
 
-## Module Structure
+## Monorepo Structure
 
 ```
 meridian/
 ├── cmd/
-│   ├── node/             ← Go node server entrypoint
-│   └── meridian-cli/     ← Go admin CLI
-├── internal/
-│   ├── raft/             ← Raft state machine, leader election, log replication
-│   ├── router/           ← Consistency level routing
-│   ├── vectorclock/      ← Vector clock management, merge, conflict detection
-│   ├── replication/      ← Async gossip replication for eventual path
-│   ├── quorum/           ← Quorum calculation, partition detection
-│   ├── snapshot/         ← Snapshot creation, streaming transfer
-│   └── middleware/       ← mTLS, node identity verification, audit log
-├── storage/              ← Rust LSM storage engine (WAL, memtable, SSTable)
-├── chaos/                ← Python chaos orchestrator
-├── checker/              ← Python linearizability verifier
-├── proto/                ← Protobuf definitions (client API + inter-node)
-├── docker/               ← Multi-node cluster docker-compose
+│   ├── node/                 ← Go node server entrypoint
+│   └── meridian-cli/         ← Admin + operator CLI
+├── core/
+│   ├── raft/                 ← Raft state machine, leader election, log replication
+│   ├── router/               ← Per-request consistency level routing
+│   ├── vectorclock/          ← Vector clock management, merge, conflict detection
+│   ├── replication/          ← Async gossip replication for eventual path
+│   ├── quorum/               ← Quorum calculation, partition detection
+│   └── snapshot/             ← Snapshot creation, streaming transfer
+├── secrets/
+│   ├── store/                ← Secret CRUD, versioning, encryption
+│   ├── rotation/             ← Automatic rotation scheduler, grace period management
+│   └── lease/                ← Lease issuance, renewal, expiry
+├── policy/
+│   ├── engine/               ← WASM sandbox (wasmtime), policy evaluation
+│   ├── compiler/             ← Rego-inspired DSL → WASM compilation
+│   └── store/                ← Policy versioning, rollback (backed by core KV)
+├── observability/
+│   ├── anomaly/              ← ML behavioral baseline, deviation scoring
+│   ├── audit/                ← Hash-chained audit log, Raft-committed entries
+│   └── metrics/              ← Prometheus instrumentation, Grafana dashboard configs
+├── storage/                  ← Rust LSM storage engine (WAL, memtable, SSTable)
+├── chaos/                    ← Python chaos orchestrator
+├── checker/                  ← Python linearizability verifier
+├── proto/                    ← Protobuf definitions (client API + inter-node)
+├── docker/                   ← Multi-node cluster docker-compose
 └── docs/
+    ├── ARCHITECTURE.md
+    ├── DESIGN_DOC.md
+    ├── RUNBOOK.md
+    ├── TRADEOFFS.md
+    └── ROADMAP.md
 ```
 
 ---
