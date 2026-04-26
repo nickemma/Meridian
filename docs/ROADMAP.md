@@ -12,119 +12,147 @@ Distributed systems correctness cannot be verified incrementally from a happy pa
 The rule: a phase is complete when the chaos suite passes, not when the unit tests pass. Happy path tests are necessary but not sufficient.
 
 ---
+## Status
 
-## Phase 1: Storage Engine and Single-Node Foundation
+| Component | Status | Description |
+|---|---|---|
+| **Project Structure** | ✅ Complete | Modular monorepo, CI/CD, multi-node Docker cluster |
+| **Storage Engine (Rust)** | 📋 Planned | LSM tree, WAL (AES-256-GCM), memtable, SSTable compaction |
+| **Raft Consensus (Go)** | 📋 Planned | Leader election, log replication, pre-vote, snapshot, compaction |
+| **gRPC API (Go)** | 📋 Planned | Secret CRUD + KV Get/Put/Delete with per-request consistency level |
+| **Strong Consistency** | 📋 Planned | Quorum reads + writes via Raft — default for all secret writes |
+| **Eventual Consistency** | 📋 Planned | Async replication, stale-flagged reads |
+| **Causal Consistency** | 📋 Planned | Vector clocks, causality tracking, conflict resolution |
+| **Secret Store** | 📋 Planned | Versioned secrets, TTL, encrypted at rest and in transit |
+| **Automatic Rotation** | 📋 Planned | Schedule-based + on-demand, grace period, quorum-committed rotation events |
+| **Lease Manager** | 📋 Planned | TTL-bound access, lease renewal, expiry queue |
+| **Policy Engine (WASM)** | 📋 Planned | Rego-inspired DSL, WASM sandbox via wasmtime, deny-by-default |
+| **Anomaly Detector (ML)** | 📋 Planned | Per-identity behavioral baseline, deviation scoring, optional auto-deny |
+| **Tamper-Evident Audit Log** | 📋 Planned | Hash-chained audit records committed through Raft |
+| **Chaos Orchestrator (Python)** | 📋 Planned | Node kills, network partitions, clock skew, secret access under partition |
+| **Linearizability Checker (Python)** | 📋 Planned | Jepsen-style history verification |
+| **Prometheus + Grafana** | 📋 Planned | Replication lag, consensus latency, quorum health, secret access rates |
+| **Admin CLI** | 📋 Planned | Cluster topology, secret management, policy upload, audit query, leader transfer |
 
-**Goal:** A single node that stores and retrieves key-value pairs durably. The foundation everything else builds on.
-
-- [x] Project structure, CI/CD, multi-node Docker cluster skeleton
-- [ ] Rust LSM storage engine
-  - [ ] WAL (write-ahead log, AES-256-GCM encryption, fsync on write)
-  - [ ] Memtable (BTreeMap, configurable size threshold)
-  - [ ] SSTable format (sorted key-value pairs, bloom filter per file)
-  - [ ] Memtable flush to SSTable (background goroutine)
-  - [ ] Read path (memtable → SSTables newest to oldest, bloom filter optimization)
-  - [ ] Crash recovery (WAL replay on startup)
-- [ ] Go gRPC API (Get, Put, Delete — single node, no replication yet)
-- [ ] Protobuf schema (KVRequest, KVResponse, ConsistencyLevel enum)
-- [ ] Integration tests (write 1000 keys, crash node, restart, verify all keys present)
-- [ ] Benchmarks (write throughput, read latency p50/p99 with and without bloom filters)
-
-**Exit criteria:** Write 10,000 keys. SIGKILL the node. Restart. All 10,000 keys are readable. Write throughput > 10,000 ops/sec on NVMe SSD. Read p99 < 5ms for a 1M key dataset with bloom filters enabled.
+**Current Milestone:** Project structure established. Beginning Rust storage engine and Raft leader election.
 
 ---
 
-## Phase 2: Raft Consensus — Leader Election
+## Roadmap
 
+### Phase 1 — Storage Engine and Single-Node Foundation
+**Goal:** A single node that stores and retrieves key-value pairs durably.
+
+- [ ] Rust LSM storage engine: WAL (AES-256-GCM), memtable, SSTable, compaction, crash recovery
+- [ ] Go gRPC API: Get, Put, Delete — single node, no replication
+- [ ] Integration tests: write 1,000 keys, SIGKILL, restart, verify all keys present
+- [ ] Benchmarks: write throughput, read latency p50/p99 with and without bloom filters
+
+**Exit:** Write 10,000 keys. Kill the node. Restart. All 10,000 keys readable. Write throughput > 10,000 ops/sec. Read p99 < 5ms for a 1M key dataset with bloom filters.
+
+---
+
+### Phase 2 — Raft Consensus: Leader Election
 **Goal:** A 3-node cluster that elects a leader and maintains leadership under node failures.
 
-- [ ] Raft state machine (Follower, Candidate, Leader roles)
-- [ ] Leader election (RequestVote RPC, randomized election timeout 150-300ms)
-- [ ] Pre-vote optimization (prevents disruption from reconnecting partitioned nodes)
-- [ ] Heartbeat (AppendEntries with no entries — leadership keep-alive)
-- [ ] Term management (reject stale messages from old terms)
-- [ ] mTLS between nodes (node identity certificates, mutual authentication)
+- [ ] Raft state machine: Follower, Candidate, Leader
+- [ ] Leader election: RequestVote RPC, randomized election timeout 150–300ms
+- [ ] Pre-vote optimization
+- [ ] Heartbeat, term management, mTLS between nodes
 - [ ] Node identity verification before cluster join
-- [ ] Election audit log (every election, every vote, term history)
-- [ ] CLI: `meridian-cli cluster status`, `meridian-cli leader transfer`
-- [ ] Chaos: node kill during election — verify new leader elected within 5s
-- [ ] Chaos: simultaneous follower kills — verify leader step-down when quorum lost
+- [ ] Election audit log
+- [ ] Chaos: node kill during election — new leader within 5s
+- [ ] Chaos: simultaneous follower kills — leader steps down when quorum lost
 
-**Exit criteria:** Kill the leader. A new leader is elected within 5 seconds, confirmed by the linearizability checker. Kill 2 of 3 nodes simultaneously. The remaining node cannot elect a leader (no quorum). Restart the two killed nodes. The cluster reforms, elects a leader, and serves requests correctly.
-
----
-
-## Phase 3: Raft Log Replication and Strong Consistency
-
-**Goal:** Writes are replicated to a quorum of nodes. Committed writes survive any single node failure.
-
-- [ ] AppendEntries RPC (log replication, batch up to max entries)
-- [ ] Log persistence (Raft log stored in WAL, recoverable after crash)
-- [ ] Commit index tracking (leader commits when quorum ACKs)
-- [ ] Read index protocol (quorum confirmation before serving strong reads)
-- [ ] Log divergence repair (nextIndex probe, follower log overwrite)
-- [ ] Snapshot creation (storage engine serialization at a log index)
-- [ ] Snapshot transfer (streaming gRPC, chunk-based, resumable)
-- [ ] Log compaction (truncate log entries before snapshot index)
-- [ ] Chaos: leader crash mid-replication — verify no committed writes lost
-- [ ] Chaos: network partition 2+1 — verify majority serves, minority rejects
-- [ ] Linearizability checker: verify strong consistency writes are linearizable
-
-**Exit criteria:** Write 1000 keys with strong consistency. Kill the leader after 500 writes commit. Restart the leader. Verify all 500 committed writes are present on all nodes. Verify the 500 in-flight writes that did not reach quorum before the kill are either present on all nodes (if they were committed) or absent on all nodes (if they were not). The linearizability checker must find no violations.
+**Exit:** Kill the leader. New leader elected within 5 seconds. Kill 2 of 3 nodes — no leader elected (no quorum). Restart both — cluster reforms correctly.
 
 ---
 
-## Phase 4: Eventual Consistency and Async Replication
+### Phase 3 — Raft Log Replication and Strong Consistency
+**Goal:** Writes committed to a quorum. Committed writes survive any single node failure.
 
-**Goal:** Eventual consistency path serves reads from any node, handles partitions with stale-flagged reads.
+- [ ] AppendEntries RPC with batching
+- [ ] Log persistence, commit index tracking, read index protocol
+- [ ] Log divergence repair, snapshot creation and streaming transfer
+- [ ] Log compaction
+- [ ] Chaos: leader crash mid-replication — no committed writes lost
+- [ ] Chaos: network partition 2+1 — majority serves, minority rejects
+- [ ] Linearizability checker: strong consistency writes verified
 
-- [ ] Async gossip replication (writes propagate to peers in background, no client blocking)
-- [ ] Replication lag tracking (per-peer lag metric, surfaced in Prometheus)
-- [ ] Stale read detection (node knows it is behind leader's commit index)
-- [ ] STALE_READ response flag (client knows the read may be stale)
-- [ ] Partition healing (buffered writes replayed on reconnect, up to buffer limit)
-- [ ] Eventual convergence verification (all nodes reach same state after partition heals)
-- [ ] Chaos: partition 2+1, write to majority, verify eventual read on minority returns stale flagged
-- [ ] Chaos: heal partition, verify minority converges within replication window
-- [ ] Chaos: write storm (1000 concurrent eventual writes), verify convergence
-
-**Exit criteria:** Partition a 3-node cluster 2+1. Write 100 keys to the majority. Read the same keys from the minority with eventual consistency — all reads return STALE_READ=true. Heal the partition. Within 30 seconds, all reads from the minority return STALE_READ=false and the correct values. No writes are lost.
+**Exit:** 1,000 strong writes. Kill leader after 500 commit. Restart. All 500 committed writes present on all nodes. Linearizability checker finds no violations.
 
 ---
 
-## Phase 5: Causal Consistency and Vector Clocks
+### Phase 4 — Secrets Management Layer
+**Goal:** Strongly consistent secrets on top of the consensus engine.
 
-**Goal:** Causal consistency path tracks causality via vector clocks and detects concurrent writes.
+- [ ] Secret store: versioned CRUD, TTL, encryption at rest and in transit
+- [ ] Automatic rotation: schedule-based, on-demand, grace period
+- [ ] Lease manager: TTL-bound access, renewal, expiry queue backed by Raft log
+- [ ] Secret versioning and audit trail (pre-hash-chain — plain append)
+- [ ] CLI: `secret put`, `secret get`, `secret rotate`, `secret versions`
+- [ ] Chaos: secret rotation during leader failover — verify no dual-valid-version window
+- [ ] Chaos: lease expiry under partition — verify expired leases are rejected cluster-wide
 
-- [ ] Vector clock implementation (per-node counter array, merge on receive)
-- [ ] Causal write (increment local VC component, attach VC to write)
-- [ ] Causal read (verify local VC ≥ client VC, return value + current VC)
-- [ ] Causality enforcement (block causal read if local VC < client VC, with bounded retry)
-- [ ] Concurrent write detection (neither VC dominates the other → conflict)
-- [ ] LWW conflict resolution (wall clock, then node ID tiebreaker)
-- [ ] Conflict log (every concurrent write, both values, resolution reason)
-- [ ] Chaos: concurrent writes from two partitioned nodes — verify conflict detection on heal
-- [ ] Chaos: causal read after partition — verify causality is not violated
-- [ ] Linearizability checker extension: verify causal reads satisfy monotonic read guarantee
-
-**Exit criteria:** Write key "x" from Node 1 (VC=[1,0,0]). Read key "x" from Node 2 — client receives VC=[1,0,0]. Write key "y" from Node 2 with client VC=[1,0,0] → write carries VC=[1,1,0]. Any subsequent causal read of "y" is guaranteed to see "x" at its value when Node 2 read it. The chaos suite verifies this guarantee holds under concurrent writes and network partitions.
+**Exit:** Rotate a secret during a network partition. Verify the old version is not accessible from the majority partition after the grace period expires. Verify the new version is accessible on all nodes after partition heals. No window where both versions are simultaneously valid across a partition.
 
 ---
 
-## Phase 6: Chaos Suite and Linearizability Verification
+### Phase 5 — Policy Engine (WASM Sandbox)
+**Goal:** Every secret access is a policy decision. Evaluation is sandboxed and cannot affect the node.
 
-**Goal:** The chaos suite is fully automated and the linearizability checker mathematically verifies correctness.
+- [ ] Rego-inspired DSL: parser, AST, type checker
+- [ ] WASM compiler: DSL → WASM via wasmtime
+- [ ] Policy evaluation on the read path: deny-by-default
+- [ ] Policy versioning and rollback via core KV store
+- [ ] Contextual evaluation: service identity, path, source IP, time of day, access history
+- [ ] CLI: `policy put`, `policy eval`, `policy rollback`
+- [ ] Chaos: policy update during partition — verify consistent policy evaluation cluster-wide
 
-- [ ] Automated chaos runner (scenario suite, parallelizable, report generation)
-- [ ] Full linearizability checker (Wing-Gong algorithm, P-compositionality optimization)
-- [ ] Chaos scenarios: all Phase 2-5 scenarios automated and reproducible
-- [ ] Clock skew injection (advance/retard node clocks by configurable amounts)
-- [ ] Byzantine fault simulation (node sends incorrect values — verify cluster rejects or isolates)
-- [ ] Prometheus metrics: replication lag, consensus latency, election frequency, quorum health
-- [ ] Grafana dashboards: cluster health, per-node write throughput, consistency level distribution
-- [ ] Benchmarking dashboard (Python): throughput vs consistency level, latency under chaos
+**Exit:** Upload a policy that allows access only during business hours. Attempt access outside that window — denied. Attempt access from a non-datacenter IP — denied. Roll back the policy — previous behavior restored. Policy evaluation latency p99 < 2ms.
 
-**Exit criteria:** The chaos suite runs the full scenario battery (node kills, partitions, clock skew, write storms) for 30 minutes without the linearizability checker finding a single violation. This is the exit criterion that matters. All others are prerequisites.
+---
+
+### Phase 6 — Causal Consistency and Vector Clocks
+**Goal:** Causal consistency path tracks causality and detects concurrent writes.
+
+- [ ] Vector clock implementation: per-node counter array, merge on receive
+- [ ] Causal write and read protocol
+- [ ] Causality enforcement with bounded retry
+- [ ] Concurrent write detection and LWW conflict resolution
+- [ ] Conflict log — every concurrent write recorded, not silently resolved
+- [ ] Chaos: concurrent writes from partitioned nodes — conflict detection on heal verified
+
+**Exit:** Write key "x" from Node 1. Read "x" from Node 2 — receive VC. Write key "y" from Node 2 with that VC. Any subsequent causal read of "y" sees "x" at the value Node 2 saw. Chaos suite verifies this under partitions.
+
+---
+
+### Phase 7 — Eventual Consistency and Async Replication
+**Goal:** Eventual path serves reads from any node with explicit staleness acknowledgment.
+
+- [ ] Async gossip replication, replication lag tracking
+- [ ] Stale read detection and STALE_READ response flag
+- [ ] Partition healing: buffered writes replayed on reconnect
+- [ ] Chaos: partition 2+1, write to majority, read from minority — STALE_READ=true
+- [ ] Chaos: heal partition — minority converges within replication window, STALE_READ=false
+
+**Exit:** Partition 2+1. Write 100 keys to majority. Read from minority — STALE_READ=true on all. Heal partition. Within 30 seconds, minority returns STALE_READ=false with correct values. No writes lost.
+
+---
+
+### Phase 8 — Observability, Anomaly Detection, and Full Chaos Suite
+**Goal:** The system is fully observable, anomalies are detected at runtime, and correctness is mathematically verified.
+
+- [ ] ML anomaly detector: per-identity behavioral baseline, deviation scoring, optional auto-deny
+- [ ] Tamper-evident audit log: hash-chained records, Raft-committed
+- [ ] Prometheus metrics: replication lag, quorum health, secret access rates, policy evaluation latency, anomaly scores
+- [ ] Grafana dashboards: cluster health, consistency level distribution, rotation status, lease queue depth
+- [ ] Full linearizability checker: Wing-Gong algorithm, P-compositionality optimization
+- [ ] Chaos: secret access under network partition — full scenario battery
+- [ ] Chaos: anomaly injection — access from unexpected source triggers detection and alert
+- [ ] 30-minute chaos run — no linearizability violations
+
+**Exit:** Chaos suite runs the full scenario battery for 30 minutes. Linearizability checker finds no violations. Anomaly detector fires within 3 accesses of a behavioral deviation. Audit log hash chain verifiable end-to-end. This is the exit criterion that matters. All others are prerequisites.
 
 ---
 
