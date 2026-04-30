@@ -1,4 +1,4 @@
-.PHONY: all build run test proto cluster-up cluster-down clean
+.PHONY: all build build-cli run test proto cluster-up cluster-down clean fmt
 
 # Build the main node binary
 build:
@@ -16,15 +16,7 @@ run:
 test:
 	go test ./... -v -race
 
-# Generate Go code from all .proto files
-# proto:
-#	protoc \
-		--go_out=. \
-		--go_opt=paths=source_relative \
-		--go-grpc_out=. \
-		--go-grpc_opt=paths=source_relative \
-		proto/*.proto
-
+# Generate Go code from all .proto file
 proto:
 	protoc \
 		--go_out=. \
@@ -33,6 +25,10 @@ proto:
 		--go-grpc_opt=paths=source_relative \
 		$(shell find proto -name "*.proto")
 
+# Format all Go code
+fmt:
+	gofmt -w .
+
 # Start a 3-node local cluster via docker-compose
 cluster-up:
 	docker compose -f infra/docker-compose.yml up --build -d
@@ -40,6 +36,10 @@ cluster-up:
 # Tear down the cluster
 cluster-down:
 	docker compose -f infra/docker-compose.yml down -v
+
+# Stream logs from all 3 nodes
+cluster-logs:
+	docker compose -f infra/docker-compose.yml logs -f
 
 # Clean built binaries
 clean:
