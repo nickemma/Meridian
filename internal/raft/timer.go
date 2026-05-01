@@ -94,6 +94,10 @@ func (t *ElectionTimer) onFired() {
 
 // randomDuration returns a random duration between min and max.
 func (t *ElectionTimer) randomDuration() time.Duration {
+	if t.maxTime <= t.minTime {
+		// Fallback: deterministic duration
+		return t.minTime
+	}
 	diff := int64(t.maxTime - t.minTime)
 	return t.minTime + time.Duration(rand.Int63n(diff))
 }

@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -72,13 +73,9 @@ func (n *Node) Run(ctx context.Context) {
 	}
 }
 
-// runHeartbeat sends AppendEntries RPCs to all peers on the heartbeat interval.
-// Called in a goroutine when this node becomes Leader.
-// Exits when this node is no longer Leader or ctx is cancelled.
-//
-// AppendEntries with empty entries = heartbeat.
-// This tells followers the leader is alive and resets their election timers.
-// Full implementation with log replication comes in Phase 3d.
+// runHeartbeat sends AppendEntries to all peers on the heartbeat interval.
+// On each tick we replicate any pending log entries to followers.
+// Empty entries = pure heartbeat. Non-empty = log replication.
 func (n *Node) runHeartbeat() {
 	ticker := time.NewTicker(n.cfg.HeartbeatInterval)
 	defer ticker.Stop()
@@ -94,39 +91,29 @@ func (n *Node) runHeartbeat() {
 			return
 		}
 
-		for _, peer := range n.peers {
-			go n.sendHeartbeat(peer)
-		}
+		// Replicate entries to all followers.
+		// If there are no new entries this is a pure heartbeat.
+		go n.replicateEntries(context.Background())
 	}
 }
 
-// sendHeartbeat sends a single empty AppendEntries to one peer.
-func (n *Node) sendHeartbeat(peer *PeerClient) {
-	req := &pb.AppendEntriesRequest{
-		Term:         n.state.CurrentTerm(),
-		LeaderId:     n.state.NodeID(),
-		PrevLogIndex: n.state.LastLogIndex(),
-		PrevLogTerm:  n.state.LastLogTerm(),
-		Entries:      nil, // empty = heartbeat
-		LeaderCommit: n.state.CommitIndex(),
+// Submit appends a command to the log and replicates it to followers.
+// Returns the log index assigned to this command.
+// Returns an error if this node is not the leader.
+func (n *Node) Submit(command []byte) (uint64, error) {
+	if n.state.GetRole() != Leader {
+		return 0, fmt.Errorf("node %s is not the leader (leader is %s)",
+			n.state.NodeID(), n.state.LeaderID())
 	}
 
-	resp, err := peer.AppendEntries(context.Background(), req)
-	if err != nil {
-		// Peer unreachable — log and move on.
-		// We will retry on the next heartbeat tick.
-		log.Printf("[raft] %s heartbeat to %s failed: %v",
-			n.state.NodeID(), peer.ID(), err)
-		return
-	}
+	entry := n.state.AppendEntry(n.state.CurrentTerm(), command)
+	log.Printf("[raft] %s accepted command at index %d",
+		n.state.NodeID(), entry.Index)
 
-	// If peer has a higher term we are a stale leader — step down.
-	if resp.Term > n.state.CurrentTerm() {
-		log.Printf("[raft] %s saw higher term %d from %s, stepping down",
-			n.state.NodeID(), resp.Term, peer.ID())
-		n.state.BecomeFollower(resp.Term)
-		n.electionTimer.Reset()
-	}
+	// Replicate immediately — don't wait for the next heartbeat tick.
+	go n.replicateEntries(context.Background())
+
+	return entry.Index, nil
 }
 
 // --- gRPC handler implementations ---
