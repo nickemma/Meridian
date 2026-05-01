@@ -1,0 +1,19 @@
+[package]
+name = "meridian-storage"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "meridian-storage"
+path = "src/main.rs"
+
+[lib]
+name = "meridian_storage"
+path = "src/lib.rs"
+
+[dependencies]
+crc32fast = "1.3"   # fast checksum for entry integrity verification
+bytes = "1.5"       # ergonomic byte buffer handling
+
+[dev-dependencies]
+tempfile = "3.8"    # temporary directories in tests — never write tests to real paths
