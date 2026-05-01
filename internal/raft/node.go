@@ -42,7 +42,6 @@ func NewNode(cfg *config.Config) *Node {
 }
 
 // Run starts the Raft node's main event loop.
-// Blocks until ctx is cancelled.
 func (n *Node) Run(ctx context.Context) {
 	log.Printf("[raft] node %s starting — role=%s term=%d",
 		n.state.NodeID(), n.state.GetRole().string(), n.state.CurrentTerm())
