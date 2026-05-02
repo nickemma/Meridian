@@ -1,6 +1,9 @@
 package raft
 
-import "sync"
+import (
+	"log"
+	"sync"
+)
 
 // Role represents the current state of a Raft node.
 // A node is always in exactly one of these three states.
@@ -171,6 +174,23 @@ func (s *State) LastLogTerm() uint64 {
 	return s.log[len(s.log)-1].Term
 }
 
+// LastApplied returns the highest log index applied to the state machine.
+func (s *State) LastApplied() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastApplied
+}
+
+// SetLastApplied advances the last applied index.
+// Never moves backward.
+func (s *State) SetLastApplied(index uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if index > s.lastApplied {
+		s.lastApplied = index
+	}
+}
+
 // AppendEntry adds a new entry to the log.
 // Called by the leader when it receives a client command.
 func (s *State) AppendEntry(term uint64, command []byte) LogEntry {
@@ -182,6 +202,12 @@ func (s *State) AppendEntry(term uint64, command []byte) LogEntry {
 		Command: command,
 	}
 	s.log = append(s.log, entry)
+
+	log.Printf("________ [log] APPEND entry index=%d term=%d totalLog=%d_______",
+		entry.Index,
+		entry.Term,
+		len(s.log),
+	)
 	return entry
 }
 

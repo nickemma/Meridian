@@ -67,3 +67,7 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("gRPC server error: %w", err)
 	}
 }
+
+func (s *Server) RaftNode() *raft.Node {
+	return s.raftNode
+}

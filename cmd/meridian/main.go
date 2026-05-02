@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/nickemma/meridian/internal/config"
 	"github.com/nickemma/meridian/internal/server"
@@ -31,6 +32,20 @@ func main() {
 
 	// Start the gRPC server. This blocks until ctx is cancelled.
 	srv := server.New(cfg)
+
+	// Temporary — submit a test command after startup to verify commit
+	go func() {
+		log.Println("********** SUBMIT GOROUTINE STARTED ***********")
+		time.Sleep(5 * time.Second) // wait for leader election
+		log.Println("ABOUT TO SUBMIT")
+		idx, err := srv.RaftNode().Submit([]byte("set x=hello"))
+		if err != nil {
+			log.Printf("[smoke] submit failed: %v", err)
+			return
+		}
+		log.Printf("[smoke] submitted command at index %d", idx)
+	}()
+
 	if err := srv.Start(ctx); err != nil {
 		log.Fatalf("server error: %v", err)
 	}

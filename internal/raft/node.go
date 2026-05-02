@@ -21,6 +21,7 @@ type Node struct {
 	peers         []*PeerClient
 	quorumSize    int
 	cfg           *config.Config
+	commitCh      chan uint64 // signals the apply loop when new entries commit
 }
 
 // NewNode creates a new Raft node from config.
@@ -39,6 +40,7 @@ func NewNode(cfg *config.Config) *Node {
 		peers:      peers,
 		quorumSize: cfg.QuorumSize,
 		cfg:        cfg,
+		commitCh:   make(chan uint64, 64),
 	}
 }
 
@@ -46,6 +48,9 @@ func NewNode(cfg *config.Config) *Node {
 func (n *Node) Run(ctx context.Context) {
 	log.Printf("[raft] node %s starting — role=%s term=%d",
 		n.state.NodeID(), n.state.GetRole().string(), n.state.CurrentTerm())
+
+	// Start the apply loop — watches for committed entries.
+	go n.runApplyLoop()
 
 	// Start the election timer — begins the countdown to first election
 	// if no leader makes contact.
@@ -56,6 +61,7 @@ func (n *Node) Run(ctx context.Context) {
 		case <-ctx.Done():
 			log.Printf("[raft] node %s stopping", n.state.NodeID())
 			n.electionTimer.Stop()
+			close(n.commitCh)
 			for _, p := range n.peers {
 				p.Close()
 			}
@@ -101,6 +107,13 @@ func (n *Node) runHeartbeat() {
 // Returns the log index assigned to this command.
 // Returns an error if this node is not the leader.
 func (n *Node) Submit(command []byte) (uint64, error) {
+	log.Printf("@@@@@@ [SUBMIT DEBUG] node=%s role=%v leader=%s logSize=%d lastIndex=%d",
+		n.state.NodeID(),
+		n.state.GetRole(),
+		n.state.LeaderID(),
+		len(n.state.log),
+		n.state.LastLogIndex(),
+	)
 	if n.state.GetRole() != Leader {
 		return 0, fmt.Errorf("node %s is not the leader (leader is %s)",
 			n.state.NodeID(), n.state.LeaderID())
