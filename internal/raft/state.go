@@ -3,6 +3,7 @@ package raft
 import (
 	"log"
 	"sync"
+	"time"
 )
 
 // Role represents the current state of a Raft node.
@@ -47,20 +48,18 @@ type State struct {
 	nodeID string // this node's unique ID e.g. "node-1"
 
 	// --- Durable state (must survive crashes) ---
-	currentTerm uint64 // latest term this node has seen — monotonically increasing
-	votedFor    string // candidateID we voted for in currentTerm ("" if none)
+	currentTerm uint64
+	votedFor    string
 	log         []LogEntry
 
 	// --- Volatile state (rebuilt on restart) ---
-	role        Role
-	leaderID    string // who the current leader is ("" if unknown)
-	commitIndex uint64 // highest log index known to be committed
-	lastApplied uint64 // highest log index applied to the state machine
+	role          Role
+	leaderID      string
+	lastHeartbeat time.Time
+	commitIndex   uint64
+	lastApplied   uint64
 
 	// --- Leader-only volatile state ---
-	// Rebuilt after every election win.
-	// nextIndex[peer]  — next log index to send to this peer
-	// matchIndex[peer] — highest index known to be replicated on this peer
 	nextIndex  map[string]uint64
 	matchIndex map[string]uint64
 }
@@ -362,4 +361,23 @@ func (s *State) MatchIndexes() map[string]uint64 {
 // NodeID returns this node's ID.
 func (s *State) NodeID() string {
 	return s.nodeID
+}
+
+// RecordHeartbeat records the time we last heard from a valid leader.
+// Called in handleAppendEntries when we accept a message.
+func (s *State) RecordHeartbeat() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastHeartbeat = time.Now()
+}
+
+// HeardFromLeaderRecently returns true if we have received a valid heartbeat within the last election timeout window.
+// Used by pre-vote to decide whether to grant a pre-vote.
+func (s *State) HeardFromLeaderRecently(within time.Duration) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.lastHeartbeat.IsZero() {
+		return false
+	}
+	return time.Since(s.lastHeartbeat) < within
 }

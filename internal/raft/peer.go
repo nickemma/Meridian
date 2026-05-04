@@ -91,6 +91,25 @@ func (p *PeerClient) AppendEntries(
 	return client.AppendEntries(ctx, req)
 }
 
+// PreVote sends a PreVote RPC to this peer.
+func (p *PeerClient) PreVote(
+	ctx context.Context,
+	req *pb.PreVoteRequest,
+) (*pb.PreVoteResponse, error) {
+	p.mu.Lock()
+	if err := p.connect(); err != nil {
+		p.mu.Unlock()
+		return nil, err
+	}
+	client := p.client
+	p.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+
+	return client.PreVote(ctx, req)
+}
+
 // Close tears down the gRPC connection.
 func (p *PeerClient) Close() {
 	p.mu.Lock()

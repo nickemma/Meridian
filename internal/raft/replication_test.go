@@ -2,7 +2,9 @@ package raft
 
 import (
 	"testing"
+	"time"
 
+	"github.com/nickemma/meridian/internal/config"
 	pb "github.com/nickemma/meridian/proto/raft"
 )
 
@@ -19,6 +21,11 @@ func newTestNode(id string, peers []string) *Node {
 		electionTimer: NewElectionTimer(0, 0),
 		peers:         peerClients,
 		quorumSize:    (len(peers)+1)/2 + 1,
+		commitCh:      make(chan uint64, 64),
+		cfg: &config.Config{
+			ElectionTimeoutMin: 150 * time.Millisecond,
+			ElectionTimeoutMax: 300 * time.Millisecond,
+		},
 	}
 }
 

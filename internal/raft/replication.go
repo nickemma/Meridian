@@ -31,6 +31,7 @@ func (n *Node) handleAppendEntries(
 
 	// Valid message from current leader — record it and reset timer.
 	n.state.SetLeader(req.LeaderId)
+	n.state.RecordHeartbeat()
 	n.electionTimer.Reset()
 
 	// Rule 3 — consistency check.
@@ -82,12 +83,6 @@ func (n *Node) handleAppendEntries(
 
 		n.state.AppendEntries(entries)
 
-		log.Printf("[raft] %s appended %d entries (index %d→%d)",
-			n.state.NodeID(),
-			len(entries),
-			entries[0].Index,
-			entries[len(entries)-1].Index,
-		)
 	}
 
 	// Rule 5 — advance commit index if leader's is ahead of ours.

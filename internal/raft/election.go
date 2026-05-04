@@ -16,7 +16,20 @@ import (
 // If the node wins, it calls BecomeLeader. If it loses or sees
 // a higher term, it calls BecomeFollower.
 func (n *Node) runElection() {
-	// Transition to Candidate — increments term, votes for self.
+
+	// Phase 1 — pre-vote check.
+	// Ask peers if we would win a real election before committing
+	// to incrementing our term. If the cluster is healthy,
+	// pre-vote will be denied and we do nothing.
+	if !n.runPreVote() {
+		log.Printf("[raft] %s pre-vote failed, skipping election",
+			n.state.NodeID())
+		n.electionTimer.Reset() // reset timer to try again later
+		return
+	}
+
+	// Phase 2 — real election.
+	// Pre-vote succeeded — safe to increment term and run.
 	term := n.state.BecomeCandidate()
 
 	log.Printf("[raft] %s starting election for term %d",

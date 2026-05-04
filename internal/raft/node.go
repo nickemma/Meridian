@@ -149,3 +149,10 @@ func (n *Node) AppendEntries(
 ) (*pb.AppendEntriesResponse, error) {
 	return n.handleAppendEntries(req), nil
 }
+
+// handles incoming PreVote RPCs. This is part of the pre-vote phase of elections,
+func (n *Node) PreVote(
+	ctx context.Context, req *pb.PreVoteRequest,
+) (*pb.PreVoteResponse, error) {
+	return n.handlePreVote(req), nil
+}
