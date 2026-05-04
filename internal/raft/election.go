@@ -35,6 +35,12 @@ func (n *Node) runElection() {
 	log.Printf("[raft] %s starting election for term %d",
 		n.state.NodeID(), term)
 
+	// Record election start
+	if n.metrics != nil {
+		n.metrics.RaftElectionsTotal.Inc()
+	}
+	defer n.recordMetrics()
+
 	// Reset the election timer so we don't immediately re-fire
 	// while waiting for vote responses.
 	n.electionTimer.Reset()

@@ -6,9 +6,9 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/nickemma/meridian/internal/config"
+	"github.com/nickemma/meridian/internal/metrics"
 	"github.com/nickemma/meridian/internal/server"
 )
 
@@ -30,26 +30,24 @@ func main() {
 		os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Start metrics server on ClientPort+1000
+	// e.g. if client port is 8080, metrics is on 9080
+	metricsPort := cfg.ClientPort + 1000
+	m := metrics.New(cfg.NodeID)
+	metricsSrv := metrics.NewServer(metricsPort)
+	go func() {
+		if err := metricsSrv.Start(ctx); err != nil {
+			log.Printf("[main] metrics server error: %v", err)
+		}
+	}()
+
 	// Start the gRPC server. This blocks until ctx is cancelled.
 	srv := server.New(cfg)
-
-	// Temporary — submit a test command after startup to verify commit
-	go func() {
-		log.Println("********** SUBMIT GOROUTINE STARTED ***********")
-		time.Sleep(5 * time.Second) // wait for leader election
-		log.Println("ABOUT TO SUBMIT")
-		idx, err := srv.RaftNode().Submit([]byte("set x=hello"))
-		if err != nil {
-			log.Printf("[smoke] submit failed: %v", err)
-			return
-		}
-		log.Printf("[smoke] submitted command at index %d", idx)
-	}()
+	srv.RaftNode().SetMetrics(m)
 
 	if err := srv.Start(ctx); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 
 	log.Printf("[main] node %s stopped cleanly", cfg.NodeID)
-
 }

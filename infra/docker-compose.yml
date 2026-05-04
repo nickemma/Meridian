@@ -1,68 +1,71 @@
 services:
-  node-1:
-    build:
-      context: .. # build from repo root where Dockerfile lives
-      dockerfile: Dockerfile
-    container_name: meridian-node-1
-    environment:
-      MERIDIAN_NODE_ID: node-1
-      MERIDIAN_RAFT_PORT: "9090"
-      MERIDIAN_CLIENT_PORT: "8080"
-      MERIDIAN_DATA_DIR: /var/lib/meridian
-      MERIDIAN_PEERS: node-2:9090,node-3:9090
-    ports:
-      - "9091:9090" # raft port exposed to host as 9091
-      - "8081:8080" # client port exposed to host as 8081
-    networks:
-      - meridian-cluster
-    volumes:
-      - node-1-data:/var/lib/meridian
+    node-1:
+        build:
+            context: .. # build from repo root where Dockerfile lives
+            dockerfile: Dockerfile
+        container_name: meridian-node-1
+        environment:
+            MERIDIAN_NODE_ID: node-1
+            MERIDIAN_RAFT_PORT: "9090"
+            MERIDIAN_CLIENT_PORT: "8080"
+            MERIDIAN_DATA_DIR: /var/lib/meridian
+            MERIDIAN_PEERS: node-2:9090,node-3:9090
+        ports:
+            - "9091:9090" # raft port exposed to host as 9091
+            - "8081:8080" # client port exposed to host as 8081
+            - "9081:9080" # metrics port exposed to host as 9081
+        networks:
+            - meridian-cluster
+        volumes:
+            - node-1-data:/var/lib/meridian
 
-  node-2:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    container_name: meridian-node-2
-    environment:
-      MERIDIAN_NODE_ID: node-2
-      MERIDIAN_RAFT_PORT: "9090"
-      MERIDIAN_CLIENT_PORT: "8080"
-      MERIDIAN_DATA_DIR: /var/lib/meridian
-      MERIDIAN_PEERS: node-1:9090,node-3:9090
-    ports:
-      - "9092:9090"
-      - "8082:8080"
-    networks:
-      - meridian-cluster
-    volumes:
-      - node-2-data:/var/lib/meridian
+    node-2:
+        build:
+            context: ..
+            dockerfile: Dockerfile
+        container_name: meridian-node-2
+        environment:
+            MERIDIAN_NODE_ID: node-2
+            MERIDIAN_RAFT_PORT: "9090"
+            MERIDIAN_CLIENT_PORT: "8080"
+            MERIDIAN_DATA_DIR: /var/lib/meridian
+            MERIDIAN_PEERS: node-1:9090,node-3:9090
+        ports:
+            - "9092:9090"
+            - "8082:8080"
+            - "9082:9080"
+        networks:
+            - meridian-cluster
+        volumes:
+            - node-2-data:/var/lib/meridian
 
-  node-3:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    container_name: meridian-node-3
-    environment:
-      MERIDIAN_NODE_ID: node-3
-      MERIDIAN_RAFT_PORT: "9090"
-      MERIDIAN_CLIENT_PORT: "8080"
-      MERIDIAN_DATA_DIR: /var/lib/meridian
-      MERIDIAN_PEERS: node-1:9090,node-2:9090
-    ports:
-      - "9093:9090"
-      - "8083:8080"
-    networks:
-      - meridian-cluster
-    volumes:
-      - node-3-data:/var/lib/meridian
+    node-3:
+        build:
+            context: ..
+            dockerfile: Dockerfile
+        container_name: meridian-node-3
+        environment:
+            MERIDIAN_NODE_ID: node-3
+            MERIDIAN_RAFT_PORT: "9090"
+            MERIDIAN_CLIENT_PORT: "8080"
+            MERIDIAN_DATA_DIR: /var/lib/meridian
+            MERIDIAN_PEERS: node-1:9090,node-2:9090
+        ports:
+            - "9093:9090"
+            - "8083:8080"
+            - "9083:9080"
+        networks:
+            - meridian-cluster
+        volumes:
+            - node-3-data:/var/lib/meridian
 
 networks:
-  meridian-cluster:
-    driver:
-      bridge # all 3 nodes on the same virtual network
-      # chaos suite will manipulate this network later
+    meridian-cluster:
+        driver:
+            bridge # all 3 nodes on the same virtual network
+            # chaos suite will manipulate this network later
 
 volumes:
-  node-1-data:
-  node-2-data:
-  node-3-data:
+    node-1-data:
+    node-2-data:
+    node-3-data:

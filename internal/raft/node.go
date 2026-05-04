@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/nickemma/meridian/internal/config"
+	"github.com/nickemma/meridian/internal/metrics"
 	pb "github.com/nickemma/meridian/proto/raft"
 )
 
@@ -21,7 +22,8 @@ type Node struct {
 	peers         []*PeerClient
 	quorumSize    int
 	cfg           *config.Config
-	commitCh      chan uint64 // signals the apply loop when new entries commit
+	commitCh      chan uint64      // signals the apply loop when new entries commit
+	metrics       *metrics.Metrics // nil-safe — checked before use
 }
 
 // NewNode creates a new Raft node from config.
@@ -41,6 +43,7 @@ func NewNode(cfg *config.Config) *Node {
 		quorumSize: cfg.QuorumSize,
 		cfg:        cfg,
 		commitCh:   make(chan uint64, 64),
+		metrics:    nil,
 	}
 }
 
@@ -96,6 +99,10 @@ func (n *Node) runHeartbeat() {
 				n.state.NodeID())
 			return
 		}
+		if n.metrics != nil {
+			n.metrics.RaftHeartbeatsTotal.Inc()
+		}
+		n.recordMetrics()
 
 		// Replicate entries to all followers.
 		// If there are no new entries this is a pure heartbeat.
@@ -155,4 +162,29 @@ func (n *Node) PreVote(
 	ctx context.Context, req *pb.PreVoteRequest,
 ) (*pb.PreVoteResponse, error) {
 	return n.handlePreVote(req), nil
+}
+
+// SetMetrics wires Prometheus metrics into the Raft node.
+func (n *Node) SetMetrics(m *metrics.Metrics) {
+	n.metrics = m
+}
+
+// recordMetrics updates Prometheus gauges from current state.
+// Called after every state transition.
+func (n *Node) recordMetrics() {
+	if n.metrics == nil {
+		return
+	}
+	n.metrics.RaftTerm.Set(float64(n.state.CurrentTerm()))
+	n.metrics.RaftCommitIndex.Set(float64(n.state.CommitIndex()))
+	n.metrics.RaftLogEntries.Set(float64(n.state.LastLogIndex()))
+
+	switch n.state.GetRole() {
+	case Follower:
+		n.metrics.RaftRole.Set(0)
+	case Candidate:
+		n.metrics.RaftRole.Set(1)
+	case Leader:
+		n.metrics.RaftRole.Set(2)
+	}
 }
