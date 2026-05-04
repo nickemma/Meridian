@@ -1,6 +1,6 @@
 # Meridian Roadmap
 
-**Current Phase:** Phase 1 — Storage Engine and Single-Node Foundation
+**Current Phase:** Phase 5 — Observability
 **Last Updated:** April 2026
 
 ---
@@ -17,16 +17,16 @@ The rule: a phase is complete when the chaos suite passes, not when the unit tes
 | Component | Status | Description |
 |---|---|---|
 | **Project Structure** | ✅ Complete | Modular monorepo, CI/CD, multi-node Docker cluster |
-| **Storage Engine (Rust)** | 📋 Planned | LSM tree, WAL (AES-256-GCM), memtable, SSTable compaction |
-| **Raft Consensus (Go)** | 📋 Planned | Leader election, log replication, pre-vote, snapshot, compaction |
-| **gRPC API (Go)** | 📋 Planned | Secret CRUD + KV Get/Put/Delete with per-request consistency level |
-| **Strong Consistency** | 📋 Planned | Quorum reads + writes via Raft — default for all secret writes |
-| **Eventual Consistency** | 📋 Planned | Async replication, stale-flagged reads |
-| **Causal Consistency** | 📋 Planned | Vector clocks, causality tracking, conflict resolution |
-| **Secret Store** | 📋 Planned | Versioned secrets, TTL, encrypted at rest and in transit |
-| **Automatic Rotation** | 📋 Planned | Schedule-based + on-demand, grace period, quorum-committed rotation events |
-| **Lease Manager** | 📋 Planned | TTL-bound access, lease renewal, expiry queue |
-| **Policy Engine (WASM)** | 📋 Planned | Rego-inspired DSL, WASM sandbox via wasmtime, deny-by-default |
+| **Storage Engine (Rust)** | ✅ Complete | LSM tree, WAL (AES-256-GCM), memtable, SSTable compaction |
+| **Raft Consensus (Go)** | ✅ Complete | Leader election, log replication, pre-vote, snapshot, compaction |
+| **gRPC API (Go)** | ✅ Complete | Secret CRUD + KV Get/Put/Delete with per-request consistency level |
+| **Strong Consistency** | ✅ Complete | Quorum reads + writes via Raft — default for all secret writes |
+| **Eventual Consistency** | ✅ Complete | Async replication, stale-flagged reads |
+| **Causal Consistency** | ✅ Complete | Vector clocks, causality tracking, conflict resolution |
+| **Secret Store** | ✅ Complete | Versioned secrets, TTL, encrypted at rest and in transit |
+| **Automatic Rotation** | ✅ Complete | Schedule-based + on-demand, grace period, quorum-committed rotation events |
+| **Lease Manager** | ✅ Complete | TTL-bound access, lease renewal, expiry queue |
+| **Policy Engine (WASM)** | ✅ Complete | Rego-inspired DSL, WASM sandbox via wasmtime, deny-by-default |
 | **Anomaly Detector (ML)** | 📋 Planned | Per-identity behavioral baseline, deviation scoring, optional auto-deny |
 | **Tamper-Evident Audit Log** | 📋 Planned | Hash-chained audit records committed through Raft |
 | **Chaos Orchestrator (Python)** | 📋 Planned | Node kills, network partitions, clock skew, secret access under partition |
