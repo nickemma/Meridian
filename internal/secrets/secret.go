@@ -25,7 +25,8 @@ type SecretVersion struct {
 	Value     []byte
 	CreatedAt time.Time
 	CreatedBy string
-	Revoked   bool // true if this version has been explicitly revoked
+	Revoked   bool      // true if this version has been explicitly revoked
+	RevokeAt  time.Time // zero means no scheduled revocation
 }
 
 // CommandType identifies what operation a Raft command represents.
@@ -41,12 +42,13 @@ const (
 // by the secrets layer. Self-contained — every node can apply it
 // without any external context.
 type Command struct {
-	Type      CommandType `json:"type"`
-	Path      string      `json:"path"`
-	Value     []byte      `json:"value,omitempty"`
-	CreatedBy string      `json:"created_by"`
-	RequestID string      `json:"request_id"` // idempotency key
-	Timestamp time.Time   `json:"timestamp"`
+	Type        CommandType   `json:"type"`
+	Path        string        `json:"path"`
+	Value       []byte        `json:"value,omitempty"`
+	CreatedBy   string        `json:"created_by"`
+	RequestID   string        `json:"request_id"` // idempotency key
+	Timestamp   time.Time     `json:"timestamp"`
+	GracePeriod time.Duration `json:"grace_period,omitempty"` // for rotate commands
 }
 
 // Encode serializes a Command into bytes for the Raft log.
@@ -72,4 +74,16 @@ func newRequestID() string {
 		panic(fmt.Sprintf("failed to generate request ID: %v", err))
 	}
 	return fmt.Sprintf("%x", b)
+}
+
+// IsRevoked returns true if this version is revoked or
+// its revocation time has passed.
+func (v *SecretVersion) IsRevoked() bool {
+	if v.Revoked {
+		return true
+	}
+	if !v.RevokeAt.IsZero() && time.Now().After(v.RevokeAt) {
+		return true
+	}
+	return false
 }

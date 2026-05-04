@@ -91,9 +91,44 @@ func (s *Store) applyDelete(cmd *Command) error {
 }
 
 func (s *Store) applyRotate(cmd *Command) error {
-	// Rotation is a put with a new value — the old version
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	existing, exists := s.secrets[cmd.Path]
+
+	version := uint64(1)
+
+	if exists {
+		version = existing.Version + 1
+
+		// Schedule the old version for revocation after the grace period.
+		// This allows services using the old credential time to reconnect.
+		if cmd.GracePeriod > 0 && len(s.versions[cmd.Path]) > 0 {
+			oldIdx := len(s.versions[cmd.Path]) - 1
+			s.versions[cmd.Path][oldIdx].RevokeAt =
+				cmd.Timestamp.Add(cmd.GracePeriod)
+		}
+	}
+
+	secret := &Secret{
+		Path:      cmd.Path,
+		Value:     cmd.Value,
+		Version:   version,
+		CreatedAt: cmd.Timestamp,
+		UpdatedAt: cmd.Timestamp,
+		CreatedBy: cmd.CreatedBy,
+	}
+
+	s.secrets[cmd.Path] = secret
+
+	s.versions[cmd.Path] = append(s.versions[cmd.Path], SecretVersion{
+		Version:   version,
+		Value:     cmd.Value,
+		CreatedAt: cmd.Timestamp,
+		CreatedBy: cmd.CreatedBy,
+	})
 	// stays in history with a grace period before revocation.
-	return s.applyPut(cmd)
+	return nil
 }
 
 // --- Read operations ---
@@ -240,19 +275,26 @@ func NewDeleteCommand(path string, createdBy string) (*Command, error) {
 }
 
 // NewRotateCommand builds a validated rotate command.
-func NewRotateCommand(path string, newValue []byte, createdBy string) (*Command, error) {
+func NewRotateCommand(path string, newValue []byte, createdBy string, gracePeriod time.Duration) (*Command, error) {
 	if err := ValidatePath(path); err != nil {
 		return nil, err
 	}
+
 	if err := ValidateValue(newValue); err != nil {
 		return nil, err
 	}
+
+	if gracePeriod < 0 {
+		return nil, fmt.Errorf("grace period cannot be negative")
+	}
+
 	return &Command{
-		Type:      CmdRotateSecret,
-		Path:      path,
-		Value:     newValue,
-		CreatedBy: createdBy,
-		RequestID: newRequestID(),
-		Timestamp: time.Now().UTC(),
+		Type:        CmdRotateSecret,
+		Path:        path,
+		Value:       newValue,
+		CreatedBy:   createdBy,
+		RequestID:   newRequestID(),
+		Timestamp:   time.Now().UTC(),
+		GracePeriod: gracePeriod,
 	}, nil
 }
