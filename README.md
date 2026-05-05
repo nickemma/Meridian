@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![Status](https://img.shields.io/badge/status-in%20development-orange)
+![Status](https://img.shields.io/badge/status-In%20development-orange)
 ![Go Version](https://img.shields.io/badge/go-1.25-blue)
 ![Rust Version](https://img.shields.io/badge/rust-1.87-orange)
 ![Python Version](https://img.shields.io/badge/python-3.12-blue)
@@ -52,58 +52,7 @@ The reason they are one system: secrets management is a distributed storage prob
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         Client Layer                                 │
-│   gRPC API  •  Secret fetch  •  Policy check  •  Lease renewal      │
-│   Consistency level per request: Strong | Causal | Eventual         │
-└─────────────────────────────────────────────────────────────────────┘
-                                ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│                      Meridian Node (Go)                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌───────────────────────────┐ │
-│  │   Request    │  │  Consistency │  │     Vector Clock          │ │
-│  │   Router     │  │  Resolver    │  │     Manager               │ │
-│  └──────────────┘  └──────────────┘  └───────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────┘
-                                ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Secrets & Policy Layer (Go)                       │
-│  ┌───────────────┐  ┌───────────────┐  ┌──────────────────────┐   │
-│  │  Secret Store │  │ Policy Engine │  │  Anomaly Detector    │   │
-│  │  + Rotation   │  │ (WASM sandbox)│  │  (ML model, Go)      │   │
-│  └───────────────┘  └───────────────┘  └──────────────────────┘   │
-│  ┌───────────────┐  ┌───────────────┐                              │
-│  │  Lease Manager│  │  Audit Engine │                              │
-│  │               │  │  (append-only)│                              │
-│  └───────────────┘  └───────────────┘                              │
-└─────────────────────────────────────────────────────────────────────┘
-                                ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Raft Consensus Layer (Go)                          │
-│   Leader Election  •  Log Replication  •  Commit  •  Snapshot        │
-└─────────────────────────────────────────────────────────────────────┘
-                                ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│   ┌───────────────────────┐   ┌──────────────────────────────┐     │
-│   │    Storage Engine     │   │      Replication Layer       │     │
-│   │       (Rust)          │   │          (Go)                │     │
-│   │  LSM  •  WAL  •  SSTables │   │  Async gossip            │    │
-│   └───────────────────────┘   └──────────────────────────────┘     │
-└─────────────────────────────────────────────────────────────────────┘
-                                ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│                       Cluster (3–5 nodes)                            │
-│   Node 1 (Leader)  •  Node 2 (Follower)  •  Node 3 (Follower)      │
-│                  mTLS between all nodes                              │
-└─────────────────────────────────────────────────────────────────────┘
-                                ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│               Chaos Orchestrator + Verifier (Python)                 │
-│   Node kills  •  Partitions  •  Clock skew  •  Linearizability      │
-│   Secret access under partition  •  Policy enforcement under chaos   │
-└─────────────────────────────────────────────────────────────────────┘
-```
+![Meridian Architecture](/docs/meridian-diagram.png)
 
 ---
 

@@ -27,12 +27,12 @@ The rule: a phase is complete when the chaos suite passes, not when the unit tes
 | **Automatic Rotation** | ✅ Complete | Schedule-based + on-demand, grace period, quorum-committed rotation events |
 | **Lease Manager** | ✅ Complete | TTL-bound access, lease renewal, expiry queue |
 | **Policy Engine (WASM)** | ✅ Complete | Rego-inspired DSL, WASM sandbox via wasmtime, deny-by-default |
-| **Anomaly Detector (ML)** | 📋 Planned | Per-identity behavioral baseline, deviation scoring, optional auto-deny |
-| **Tamper-Evident Audit Log** | 📋 Planned | Hash-chained audit records committed through Raft |
-| **Chaos Orchestrator (Python)** | 📋 Planned | Node kills, network partitions, clock skew, secret access under partition |
-| **Linearizability Checker (Python)** | 📋 Planned | Jepsen-style history verification |
-| **Prometheus + Grafana** | 📋 Planned | Replication lag, consensus latency, quorum health, secret access rates |
-| **Admin CLI** | 📋 Planned | Cluster topology, secret management, policy upload, audit query, leader transfer |
+| **Anomaly Detector (ML)** | ✅ Complete | Per-identity behavioral baseline, deviation scoring, optional auto-deny |
+| **Tamper-Evident Audit Log** | ✅ Complete | Hash-chained audit records committed through Raft |
+| **Chaos Orchestrator (Python)** | ✅ Complete | Node kills, network partitions, clock skew, secret access under partition |
+| **Linearizability Checker (Python)** | ✅ Complete | Jepsen-style history verification |
+| **Prometheus + Grafana** | ✅ Complete | Replication lag, consensus latency, quorum health, secret access rates |
+| **Admin CLI** | ✅ Complete | Cluster topology, secret management, policy upload, audit query, leader transfer |
 
 **Current Milestone:** Project structure established. Beginning Rust storage engine and Raft leader election.
 
