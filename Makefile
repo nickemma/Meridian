@@ -31,7 +31,7 @@ fmt:
 
 # Start a 3-node local cluster via docker-compose
 cluster-up:
-	docker compose -f infra/docker-compose.yml up --build -d
+	docker compose -f infra/docker-compose.yml up --build --force-recreate -d
 
 # Tear down the cluster
 cluster-down:
@@ -40,6 +40,13 @@ cluster-down:
 # Stream logs from all 3 nodes
 cluster-logs:
 	docker compose -f infra/docker-compose.yml logs -f
+
+# Run the full chaos suite against the live cluster
+chaos-run:
+	make cluster-up
+	sleep 5
+	cd chaos && source venv/bin/activate && python3 run_chaos.py
+	make cluster-down
 
 # Clean built binaries
 clean:

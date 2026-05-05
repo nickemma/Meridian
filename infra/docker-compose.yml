@@ -4,6 +4,10 @@ services:
             context: .. # build from repo root where Dockerfile lives
             dockerfile: Dockerfile
         container_name: meridian-node-1
+        privileged: true # needed for chaos suite to manipulate network
+        cap_add:
+            - NET_ADMIN # needed for chaos suite to manipulate network
+            - SYS_TIME # needed for chaos suite to manipulate time
         environment:
             MERIDIAN_NODE_ID: node-1
             MERIDIAN_RAFT_PORT: "9090"
@@ -24,6 +28,10 @@ services:
             context: ..
             dockerfile: Dockerfile
         container_name: meridian-node-2
+        privileged: true # needed for chaos suite to manipulate network
+        cap_add:
+            - NET_ADMIN # needed for chaos suite to manipulate network
+            - SYS_TIME # needed for chaos suite to manipulate time
         environment:
             MERIDIAN_NODE_ID: node-2
             MERIDIAN_RAFT_PORT: "9090"
@@ -44,6 +52,10 @@ services:
             context: ..
             dockerfile: Dockerfile
         container_name: meridian-node-3
+        privileged: true # needed for chaos suite to manipulate network
+        cap_add:
+            - NET_ADMIN # needed for chaos suite to manipulate network
+            - SYS_TIME # needed for chaos suite to manipulate time
         environment:
             MERIDIAN_NODE_ID: node-3
             MERIDIAN_RAFT_PORT: "9090"

@@ -18,6 +18,8 @@ RUN go build -o bin/meridian ./cmd/meridian
 # This keeps the image small and reduces attack surface.
 FROM alpine:3.19
 
+RUN apk add --no-cache iptables
+
 WORKDIR /app
 
 # Create the data directory the node will write its WAL to
