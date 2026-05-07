@@ -1,2 +1,16 @@
 bin/
 *.pb.go
+
+# Python virtual env
+choas/venv/
+choas/__pycache__/
+
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+venv/
+__pycache__/
+*.pyc
