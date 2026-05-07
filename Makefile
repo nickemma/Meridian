@@ -1,12 +1,8 @@
-.PHONY: all build build-cli run test proto cluster-up cluster-down clean fmt
+.PHONY: all build run test proto cluster-up cluster-down clean fmt
 
 # Build the main node binary
 build:
 	go build -o bin/meridian ./cmd/meridian
-
-# Build the CLI binary
-build-cli:
-	go build -o bin/meridian-cli ./cmd/meridian-cli
 
 # Run the node locally (single node, no cluster)
 run:
@@ -24,10 +20,6 @@ proto:
 		--go-grpc_out=. \
 		--go-grpc_opt=paths=source_relative \
 		$(shell find proto -name "*.proto")
-
-# Format all Go code
-fmt:
-	gofmt -w .
 
 # Start a 3-node local cluster via docker-compose
 cluster-up:
