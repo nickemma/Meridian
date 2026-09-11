@@ -42,7 +42,10 @@ func main() {
 	}()
 
 	// Start the gRPC server. This blocks until ctx is cancelled.
-	srv := server.New(cfg)
+	srv, err := server.New(cfg)
+	if err != nil {
+		log.Fatalf("create server: %v", err)
+	}
 	srv.RaftNode().SetMetrics(m)
 
 	if err := srv.Start(ctx); err != nil {

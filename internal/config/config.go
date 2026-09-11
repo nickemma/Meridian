@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/nickemma/meridian/internal/consistency"
 )
 
 // Config holds everything a Meridian node needs to know about itself
@@ -30,6 +32,11 @@ type Config struct {
 
 	// Cluster
 	QuorumSize int // how many nodes must agree for a commit (majority)
+
+	// Policies select a single write mechanism per immutable namespace. An empty
+	// configuration receives a root strong policy for backward-compatible local
+	// development; production deployments should explicitly supply policies.
+	Policies []consistency.NamespacePolicy
 }
 
 // Peer represents another node in the cluster.
@@ -54,6 +61,10 @@ func Load() (*Config, error) {
 	}
 
 	quorumSize := (len(peers)+1)/2 + 1 // majority of total nodes (peers + self)
+	policies, err := parsePolicies(os.Getenv("MERIDIAN_POLICIES"))
+	if err != nil {
+		return nil, fmt.Errorf("parsing namespace policies: %w", err)
+	}
 
 	return &Config{
 		NodeID:             nodeID,
@@ -65,7 +76,47 @@ func Load() (*Config, error) {
 		ElectionTimeoutMax: 300 * time.Millisecond,
 		HeartbeatInterval:  50 * time.Millisecond,
 		QuorumSize:         quorumSize,
+		Policies:           policies,
 	}, nil
+}
+
+// parsePolicies accepts comma-separated prefix:class:version entries, for
+// example "/strong/:strong:1,/causal/:causal:2,/eventual/:eventual:3". Empty
+// input deliberately leaves the slice empty so Server.New installs its explicit
+// development-only root strong default.
+func parsePolicies(raw string) ([]consistency.NamespacePolicy, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	entries := strings.Split(raw, ",")
+	policies := make([]consistency.NamespacePolicy, 0, len(entries))
+	for _, entry := range entries {
+		parts := strings.Split(strings.TrimSpace(entry), ":")
+		if len(parts) != 3 {
+			return nil, fmt.Errorf("invalid policy %q; expected prefix:class:version", entry)
+		}
+		version, err := strconv.ParseUint(parts[2], 10, 64)
+		if err != nil || version == 0 {
+			return nil, fmt.Errorf("invalid policy version %q", parts[2])
+		}
+		var class consistency.Class
+		switch parts[1] {
+		case "strong":
+			class = consistency.Strong
+		case "causal":
+			class = consistency.Causal
+		case "eventual":
+			class = consistency.Eventual
+		default:
+			return nil, fmt.Errorf("invalid policy class %q", parts[1])
+		}
+		policy := consistency.NamespacePolicy{Prefix: parts[0], Class: class, Version: version}
+		if policy.Prefix != "/" && (!strings.HasPrefix(policy.Prefix, "/") || !strings.HasSuffix(policy.Prefix, "/")) {
+			return nil, fmt.Errorf("invalid policy prefix %q", policy.Prefix)
+		}
+		policies = append(policies, policy)
+	}
+	return policies, nil
 }
 
 // parsePeers parses "node-2:9090,node-3:9090" into a slice of Peer.

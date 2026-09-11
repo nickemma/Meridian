@@ -1,7 +1,8 @@
 package raft
 
 import (
-	"log"
+	"bytes"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -28,6 +29,9 @@ func (r Role) string() string {
 		return "Unknown"
 	}
 }
+
+// String returns the protocol role for status and structured logs.
+func (r Role) String() string { return r.string() }
 
 // LogEntry is a single entry in the Raft log.
 // Every state change in Meridian is a LogEntry committed through consensus.
@@ -62,22 +66,44 @@ type State struct {
 	// --- Leader-only volatile state ---
 	nextIndex  map[string]uint64
 	matchIndex map[string]uint64
+
+	store         StateStore
+	durabilityErr error
 }
 
 // NewState creates the initial state for a Raft node.
 // Every node starts as a Follower in term 0 with an empty log.
 func NewState(nodeID string) *State {
+	return newState(nodeID, PersistentState{}, nil)
+}
+
+// NewStateFromStore restores durable Raft state before the node joins the
+// cluster. A corrupt or incomplete state file prevents startup rather than
+// allowing a node to participate with an invented history.
+func NewStateFromStore(nodeID string, store StateStore) (*State, error) {
+	if store == nil {
+		return nil, fmt.Errorf("raft state store is required")
+	}
+	persisted, err := store.Load()
+	if err != nil {
+		return nil, err
+	}
+	return newState(nodeID, persisted, store), nil
+}
+
+func newState(nodeID string, persisted PersistentState, store StateStore) *State {
 	return &State{
 		nodeID:      nodeID,
-		currentTerm: 0,
-		votedFor:    "",
-		log:         []LogEntry{},
+		currentTerm: persisted.CurrentTerm,
+		votedFor:    persisted.VotedFor,
+		log:         clonePersistentState(persisted).Log,
 		role:        Follower,
 		leaderID:    "",
-		commitIndex: 0,
-		lastApplied: 0,
+		commitIndex: persisted.CommitIndex,
+		lastApplied: persisted.LastApplied,
 		nextIndex:   make(map[string]uint64),
 		matchIndex:  make(map[string]uint64),
+		store:       store,
 	}
 }
 
@@ -104,12 +130,15 @@ func (s *State) GetRole() Role {
 func (s *State) BecomeFollower(term uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.currentTerm = term
+	if term > s.currentTerm {
+		s.currentTerm = term
+		s.votedFor = ""
+	}
 	s.role = Follower
-	s.votedFor = ""
 	s.leaderID = ""
 	s.nextIndex = make(map[string]uint64)
 	s.matchIndex = make(map[string]uint64)
+	s.persistLocked()
 }
 
 // BecomeCandidate transitions this node to Candidate.
@@ -122,6 +151,7 @@ func (s *State) BecomeCandidate() uint64 {
 	s.role = Candidate
 	s.votedFor = s.nodeID // vote for ourselves
 	s.leaderID = ""
+	s.persistLocked()
 	return s.currentTerm
 }
 
@@ -187,7 +217,29 @@ func (s *State) SetLastApplied(index uint64) {
 	defer s.mu.Unlock()
 	if index > s.lastApplied {
 		s.lastApplied = index
+		s.persistLocked()
 	}
+}
+
+// DurabilityError reports the latest failed state flush. Callers must not
+// acknowledge a vote, replicated entry, or client command while it is non-nil.
+func (s *State) DurabilityError() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.durabilityErr
+}
+
+func (s *State) persistLocked() {
+	if s.store == nil {
+		return
+	}
+	s.durabilityErr = s.store.Save(PersistentState{
+		CurrentTerm: s.currentTerm,
+		VotedFor:    s.votedFor,
+		Log:         s.log,
+		CommitIndex: s.commitIndex,
+		LastApplied: s.lastApplied,
+	})
 }
 
 // AppendEntry adds a new entry to the log.
@@ -201,12 +253,8 @@ func (s *State) AppendEntry(term uint64, command []byte) LogEntry {
 		Command: command,
 	}
 	s.log = append(s.log, entry)
+	s.persistLocked()
 
-	log.Printf("________ [log] APPEND entry index=%d term=%d totalLog=%d_______",
-		entry.Index,
-		entry.Term,
-		len(s.log),
-	)
 	return entry
 }
 
@@ -241,6 +289,7 @@ func (s *State) TruncateFrom(index uint64) {
 		return
 	}
 	s.log = s.log[:index-1]
+	s.persistLocked()
 }
 
 // AppendEntries appends a slice of entries to the log.
@@ -249,6 +298,63 @@ func (s *State) AppendEntries(entries []LogEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.log = append(s.log, entries...)
+	s.persistLocked()
+}
+
+// MergeEntriesFromLeader incorporates a validated AppendEntries suffix in one
+// durable state transition. Existing entries with the same index and term are
+// retained; the first conflicting uncommitted entry and everything after it is
+// replaced. It never creates the transient state "commit index beyond log"
+// that separate truncate and append operations could expose to another RPC.
+func (s *State) MergeEntriesFromLeader(prevLogIndex uint64, entries []LogEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if prevLogIndex > uint64(len(s.log)) {
+		return fmt.Errorf("previous log index %d exceeds log length %d", prevLogIndex, len(s.log))
+	}
+	for offset, entry := range entries {
+		expected := prevLogIndex + uint64(offset) + 1
+		if entry.Index != expected || entry.Term == 0 {
+			return fmt.Errorf("invalid replicated entry at offset %d: index=%d term=%d, want index %d and non-zero term", offset, entry.Index, entry.Term, expected)
+		}
+	}
+
+	updated := cloneLogEntries(s.log)
+	for offset, entry := range entries {
+		index := prevLogIndex + uint64(offset) + 1
+		if index <= uint64(len(updated)) {
+			existing := updated[index-1]
+			if existing.Term == entry.Term && bytes.Equal(existing.Command, entry.Command) {
+				continue
+			}
+			if index <= s.commitIndex {
+				return fmt.Errorf("refusing to replace committed entry at index %d", index)
+			}
+			updated = updated[:index-1]
+		}
+		updated = append(updated, LogEntry{Index: entry.Index, Term: entry.Term, Command: bytes.Clone(entry.Command)})
+	}
+
+	if len(updated) == len(s.log) {
+		return nil
+	}
+	previous := s.log
+	s.log = updated
+	s.persistLocked()
+	if s.durabilityErr != nil {
+		s.log = previous
+		return s.durabilityErr
+	}
+	return nil
+}
+
+func cloneLogEntries(entries []LogEntry) []LogEntry {
+	clone := make([]LogEntry, len(entries))
+	for index, entry := range entries {
+		clone[index] = LogEntry{Index: entry.Index, Term: entry.Term, Command: bytes.Clone(entry.Command)}
+	}
+	return clone
 }
 
 // EntriesFrom returns all log entries starting at the given index.
@@ -278,6 +384,7 @@ func (s *State) SetCommitIndex(index uint64) {
 	defer s.mu.Unlock()
 	if index > s.commitIndex {
 		s.commitIndex = index
+		s.persistLocked()
 	}
 }
 
@@ -295,6 +402,7 @@ func (s *State) GrantVote(candidateID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.votedFor = candidateID
+	s.persistLocked()
 }
 
 // --- Leader tracking ---

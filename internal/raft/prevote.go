@@ -68,14 +68,17 @@ func (n *Node) runPreVote() bool {
 	}
 
 	<-done
+	mu.Lock()
 	won := preVotesWon >= n.quorumSize
+	finalPreVotes := preVotesWon
+	mu.Unlock()
 
 	if won {
 		log.Printf("[raft] %s pre-vote succeeded (%d votes) — proceeding to election",
-			n.state.NodeID(), preVotesWon)
+			n.state.NodeID(), finalPreVotes)
 	} else {
 		log.Printf("[raft] %s pre-vote failed (%d votes) — cluster is healthy",
-			n.state.NodeID(), preVotesWon)
+			n.state.NodeID(), finalPreVotes)
 	}
 
 	return won
@@ -95,6 +98,10 @@ func (n *Node) handlePreVote(
 	req *pb.PreVoteRequest,
 ) *pb.PreVoteResponse {
 	currentTerm := n.state.CurrentTerm()
+	if n.state.GetRole() == Leader {
+		log.Printf("[raft] %s denying pre-vote to %s — leader is alive", n.state.NodeID(), req.CandidateId)
+		return &pb.PreVoteResponse{Term: currentTerm, VoteGranted: false}
+	}
 
 	// Deny if candidate's proposed term is behind ours.
 	if req.NextTerm <= currentTerm {

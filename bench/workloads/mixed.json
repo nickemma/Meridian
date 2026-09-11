@@ -1,0 +1,13 @@
+{
+  "name": "storefront-mixed-v1",
+  "seed": 20260910,
+  "description": "Pre-registered mixed workload from docs/research.md section 3.3.",
+  "operations": [
+    {"name": "inventory_write", "share": 0.10, "consistency": "strong", "operation": "compare_and_set", "namespace": "/strong/inventory/"},
+    {"name": "inventory_read", "share": 0.10, "consistency": "strong", "operation": "get", "namespace": "/strong/inventory/"},
+    {"name": "cart_write", "share": 0.15, "consistency": "causal", "operation": "put", "namespace": "/causal/cart/"},
+    {"name": "cart_read", "share": 0.25, "consistency": "causal", "operation": "get", "namespace": "/causal/cart/"},
+    {"name": "impression_write", "share": 0.20, "consistency": "eventual", "operation": "put", "namespace": "/eventual/impression/"},
+    {"name": "recommendation_read", "share": 0.20, "consistency": "eventual", "operation": "get", "namespace": "/eventual/recommendation/"}
+  ]
+}

@@ -58,16 +58,16 @@ func (n *Node) advanceCommitIndex() {
 
 	// Advance the commit index.
 	n.state.SetCommitIndex(quorumIndex)
+	if err := n.state.DurabilityError(); err != nil {
+		log.Printf("[raft] %s failed to persist commit index %d: %v", n.state.NodeID(), quorumIndex, err)
+		return
+	}
 
 	log.Printf("[raft] %s committed entries up to index %d (term %d)",
 		n.state.NodeID(), quorumIndex, entryTerm)
 
 	// Notify the apply goroutine that new entries are ready.
-	select {
-	case n.commitCh <- quorumIndex:
-	default:
-		// Channel full — apply loop will catch up on its own.
-	}
+	n.notifyApply(quorumIndex)
 }
 
 // runApplyLoop watches for newly committed entries and applies them
@@ -78,8 +78,18 @@ func (n *Node) advanceCommitIndex() {
 // In Meridian this means writing to the storage engine.
 // For now we log it — the storage engine integration comes in Phase 4.
 func (n *Node) runApplyLoop() {
-	for range n.commitCh {
-		n.applyCommitted()
+	for {
+		select {
+		case <-n.stopCh:
+			return
+		case <-n.commitCh:
+			select {
+			case <-n.stopCh:
+				return
+			default:
+			}
+			n.applyCommitted()
+		}
 	}
 }
 
@@ -99,11 +109,21 @@ func (n *Node) applyCommitted() {
 			break
 		}
 
-		// Apply the entry to the state machine.
-		// Phase 4 wires this to the storage engine.
-		log.Printf("[raft] %s applying entry index=%d term=%d command=%q",
-			n.state.NodeID(), entry.Index, entry.Term, entry.Command)
+		if err := n.stateMachine.Apply(entry.Index, entry.Command); err != nil {
+			// Advancing lastApplied after a failed durable operation would allow
+			// replicas to diverge permanently. Leave the entry pending; a later
+			// commit notification will retry it, while the node health layer added
+			// in Phase 3 will surface persistent application failures.
+			log.Printf("[raft] %s failed to apply entry index=%d term=%d: %v",
+				n.state.NodeID(), entry.Index, entry.Term, err)
+			return
+		}
 
 		n.state.SetLastApplied(lastApplied)
+		if err := n.state.DurabilityError(); err != nil {
+			log.Printf("[raft] %s failed to persist last applied %d: %v", n.state.NodeID(), lastApplied, err)
+			return
+		}
+		n.completeApply(lastApplied, nil)
 	}
 }

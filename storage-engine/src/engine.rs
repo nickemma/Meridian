@@ -50,8 +50,10 @@ impl StorageEngine {
         let mut memtable = Memtable::new(DEFAULT_FLUSH_THRESHOLD);
         let entries = Wal::recover_entries(&wal_path)?;
         for entry in entries {
-            let (key, value) = deserialize_wal_entry(&entry.data)?;
-            memtable.put(key, value);
+            match deserialize_wal_entry(&entry.data)? {
+                WalOperation::Put { key, value } => memtable.put(key, value),
+                WalOperation::Delete { key } => memtable.delete(key),
+            }
         }
 
         // Load existing SSTables from disk, newest first.
@@ -143,6 +145,14 @@ impl StorageEngine {
         flush(&mut inner)
     }
 
+    /// Compact all immutable tables into one table. The newest value (or
+    /// tombstone) for every key is retained. Compaction is explicit for now so
+    /// callers can choose when to pay its write amplification.
+    pub fn compact(&self) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        compact(&mut inner)
+    }
+
     /// Number of SSTables currently on disk.
     pub fn sstable_count(&self) -> usize {
         self.inner.lock().unwrap().sstables.len()
@@ -165,9 +175,7 @@ fn flush(inner: &mut EngineInner) -> io::Result<()> {
     }
 
     // Name the SSTable file by count — simple monotonic naming
-    let sst_path = inner
-        .data_dir
-        .join(format!("{:04}.sst", inner.sstables.len()));
+    let sst_path = next_sstable_path(&inner.data_dir)?;
 
     let entries = old.into_sorted_entries();
     let sst = SSTable::write(&sst_path, entries)?;
@@ -175,6 +183,40 @@ fn flush(inner: &mut EngineInner) -> io::Result<()> {
     // Prepend so index 0 is always newest
     inner.sstables.insert(0, sst);
 
+    // The new table is published and synced before we discard the WAL entries
+    // it contains. A crash before reset only causes harmless replay; a crash
+    // after reset can recover from the durable SSTable.
+    inner.wal.reset()?;
+
+    Ok(())
+}
+
+/// Merge every immutable table into one. Tables are stored newest first, so the
+/// first value seen for a key is its current value. Retaining tombstones is
+/// deliberate: it preserves deletions if a later compaction strategy stops
+/// merging all historical tables at once.
+fn compact(inner: &mut EngineInner) -> io::Result<()> {
+    if inner.sstables.len() < 2 {
+        return Ok(());
+    }
+
+    let mut newest = std::collections::BTreeMap::new();
+    for sst in &inner.sstables {
+        for entry in sst.scan_all()? {
+            newest.entry(entry.key).or_insert(entry.value);
+        }
+    }
+
+    let output_path = next_sstable_path(&inner.data_dir)?;
+    let output = SSTable::write(&output_path, newest.into_iter().collect())?;
+
+    // Do not remove an input until its replacement has been durably published.
+    // The output's directory entry was synced by SSTable::write.
+    for sst in &inner.sstables {
+        fs::remove_file(sst.path())?;
+    }
+    sync_directory(&inner.data_dir)?;
+    inner.sstables = vec![output];
     Ok(())
 }
 
@@ -190,6 +232,24 @@ fn load_sstables(data_dir: &Path) -> io::Result<Vec<SSTable>> {
     paths.sort(); // alphabetical = chronological for zero-padded names
 
     paths.iter().map(SSTable::open).collect()
+}
+
+fn next_sstable_path(data_dir: &Path) -> io::Result<PathBuf> {
+    let highest = fs::read_dir(data_dir)?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.extension().is_some_and(|extension| extension == "sst"))
+                .then(|| path.file_stem()?.to_str()?.parse::<u64>().ok())
+                .flatten()
+        })
+        .max()
+        .map_or(0, |id| id + 1);
+    Ok(data_dir.join(format!("{:020}.sst", highest)))
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
 }
 
 // WAL entry serialization format:
@@ -218,7 +278,12 @@ fn serialize_tombstone(key: &[u8]) -> Vec<u8> {
     buf
 }
 
-fn deserialize_wal_entry(data: &[u8]) -> io::Result<(Vec<u8>, Vec<u8>)> {
+enum WalOperation {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+}
+
+fn deserialize_wal_entry(data: &[u8]) -> io::Result<WalOperation> {
     if data.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -247,14 +312,9 @@ fn deserialize_wal_entry(data: &[u8]) -> io::Result<(Vec<u8>, Vec<u8>)> {
     match entry_type {
         TYPE_PUT => {
             let value = data[5 + key_len..].to_vec();
-            Ok((key, value))
+            Ok(WalOperation::Put { key, value })
         }
-        TYPE_TOMBSTONE => {
-            // Tombstones are handled by memtable.delete() at the call site.
-            // Here we return an empty value as a signal — the engine
-            // re-applies the tombstone on WAL replay.
-            Ok((key, vec![]))
-        }
+        TYPE_TOMBSTONE => Ok(WalOperation::Delete { key }),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown WAL entry type: {}", entry_type),
@@ -351,5 +411,44 @@ mod tests {
         // Reopen — WAL replay must restore the entry
         let engine = StorageEngine::open(dir.path()).unwrap();
         assert_eq!(engine.get(b"survived").unwrap(), Some(b"yes".to_vec()));
+    }
+
+    #[test]
+    fn test_tombstone_survives_reopen() {
+        let dir = tempdir().unwrap();
+
+        {
+            let engine = StorageEngine::open(dir.path()).unwrap();
+            engine.put(b"deleted".to_vec(), b"value".to_vec()).unwrap();
+            engine.delete(b"deleted".to_vec()).unwrap();
+        }
+
+        let engine = StorageEngine::open(dir.path()).unwrap();
+        assert_eq!(engine.get(b"deleted").unwrap(), None);
+    }
+
+    #[test]
+    fn test_compaction_retains_newest_values_and_tombstones() {
+        let dir = tempdir().unwrap();
+        let engine = StorageEngine::open(dir.path()).unwrap();
+
+        engine.put(b"updated".to_vec(), b"old".to_vec()).unwrap();
+        engine
+            .put(b"removed".to_vec(), b"present".to_vec())
+            .unwrap();
+        engine.flush().unwrap();
+        engine.put(b"updated".to_vec(), b"new".to_vec()).unwrap();
+        engine.delete(b"removed".to_vec()).unwrap();
+        engine.flush().unwrap();
+
+        engine.compact().unwrap();
+        assert_eq!(engine.sstable_count(), 1);
+        assert_eq!(engine.get(b"updated").unwrap(), Some(b"new".to_vec()));
+        assert_eq!(engine.get(b"removed").unwrap(), None);
+
+        drop(engine);
+        let reopened = StorageEngine::open(dir.path()).unwrap();
+        assert_eq!(reopened.get(b"updated").unwrap(), Some(b"new".to_vec()));
+        assert_eq!(reopened.get(b"removed").unwrap(), None);
     }
 }

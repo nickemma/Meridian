@@ -16,6 +16,14 @@ import (
 // If the node wins, it calls BecomeLeader. If it loses or sees
 // a higher term, it calls BecomeFollower.
 func (n *Node) runElection() {
+	// A timer notification can have been queued immediately before a valid
+	// heartbeat reset it. Check the actual heartbeat time before starting a
+	// network election, so that stale timer notifications cannot depose a
+	// newly elected leader.
+	if n.state.GetRole() == Leader || n.state.HeardFromLeaderRecently(n.cfg.ElectionTimeoutMin) {
+		n.electionTimer.Reset()
+		return
+	}
 
 	// Phase 1 — pre-vote check.
 	// Ask peers if we would win a real election before committing
@@ -31,6 +39,11 @@ func (n *Node) runElection() {
 	// Phase 2 — real election.
 	// Pre-vote succeeded — safe to increment term and run.
 	term := n.state.BecomeCandidate()
+	if err := n.state.DurabilityError(); err != nil {
+		log.Printf("[raft] %s cannot start election: persist term %d: %v", n.state.NodeID(), term, err)
+		n.electionTimer.Reset()
+		return
+	}
 
 	log.Printf("[raft] %s starting election for term %d",
 		n.state.NodeID(), term)
@@ -83,6 +96,9 @@ func (n *Node) runElection() {
 				log.Printf("[raft] %s saw higher term %d from %s, stepping down",
 					n.state.NodeID(), resp.Term, peer.ID())
 				n.state.BecomeFollower(resp.Term)
+				if err := n.state.DurabilityError(); err != nil {
+					log.Printf("[raft] %s failed to persist higher term %d: %v", n.state.NodeID(), resp.Term, err)
+				}
 				n.electionTimer.Reset()
 				// Signal done so the result goroutine exits cleanly.
 				select {
@@ -109,6 +125,10 @@ func (n *Node) runElection() {
 	// Wait for quorum or all peers to respond.
 	go func() {
 		<-done
+		mu.Lock()
+		won := votesWon >= n.quorumSize
+		finalVotes := votesWon
+		mu.Unlock()
 
 		// Check we are still a Candidate in the same term.
 		// We might have stepped down already if we saw a higher term.
@@ -116,9 +136,9 @@ func (n *Node) runElection() {
 			return
 		}
 
-		if votesWon >= n.quorumSize {
+		if won {
 			log.Printf("[raft] %s won election for term %d with %d votes",
-				n.state.NodeID(), term, votesWon)
+				n.state.NodeID(), term, finalVotes)
 
 			peerIDs := make([]string, len(n.peers))
 			for i, p := range n.peers {
@@ -133,7 +153,7 @@ func (n *Node) runElection() {
 			go n.runHeartbeat()
 		} else {
 			log.Printf("[raft] %s lost election for term %d with %d votes",
-				n.state.NodeID(), term, votesWon)
+				n.state.NodeID(), term, finalVotes)
 			// Stay as Candidate — election timer will fire again
 			// and start a new election.
 		}
@@ -145,6 +165,9 @@ func (n *Node) runElection() {
 func (n *Node) handleRequestVote(
 	req *pb.RequestVoteRequest,
 ) *pb.RequestVoteResponse {
+	n.protocolMu.Lock()
+	defer n.protocolMu.Unlock()
+
 	currentTerm := n.state.CurrentTerm()
 
 	// Rule 1 — if the candidate's term is behind ours, deny immediately.
@@ -160,6 +183,10 @@ func (n *Node) handleRequestVote(
 	// Rule 2 — if we see a higher term, update and step down.
 	if req.Term > currentTerm {
 		n.state.BecomeFollower(req.Term)
+		if err := n.state.DurabilityError(); err != nil {
+			log.Printf("[raft] %s cannot persist term %d while handling vote: %v", n.state.NodeID(), req.Term, err)
+			return &pb.RequestVoteResponse{Term: currentTerm, VoteGranted: false}
+		}
 		currentTerm = req.Term
 		n.electionTimer.Reset()
 	}
@@ -197,6 +224,10 @@ func (n *Node) handleRequestVote(
 
 	// All rules passed — grant the vote.
 	n.state.GrantVote(req.CandidateId)
+	if err := n.state.DurabilityError(); err != nil {
+		log.Printf("[raft] %s cannot persist vote for %s: %v", n.state.NodeID(), req.CandidateId, err)
+		return &pb.RequestVoteResponse{Term: currentTerm, VoteGranted: false}
+	}
 	n.electionTimer.Reset() // reset timer — we just heard from a valid candidate
 
 	log.Printf("[raft] %s granting vote to %s for term %d",

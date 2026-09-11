@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package meridian.causal;
+
+option go_package = "github.com/nickemma/meridian/proto/causal";
+
+// ReplicatedRecord is the wire representation of the common causal/eventual
+// envelope. Vector clocks are stable binary encodings, not protobuf maps, so
+// their bytes can be recorded and compared deterministically.
+message ReplicatedRecord {
+  bytes key = 1;
+  bytes value = 2;
+  bool tombstone = 3;
+  bytes version_vector = 4;
+  bytes dependencies = 5;
+  string origin = 6;
+  uint64 raft_index = 7;
+  uint64 policy_version = 8;
+}
+
+message PushRequest {
+  ReplicatedRecord record = 1;
+}
+
+message PushResponse {
+  // applied is false when this replica retained the record until a dependency
+  // becomes locally visible. The sender may safely retry either response.
+  bool applied = 1;
+}
+
+// CausalReplicationService uses push dissemination for the first causal path.
+// Anti-entropy and durable receive queues will be added before it is used as a
+// production availability mechanism.
+service CausalReplicationService {
+  rpc Push(PushRequest) returns (PushResponse);
+}
+
+message GossipRequest {
+  repeated ReplicatedRecord records = 1;
+}
+
+message GossipResponse {
+  uint32 accepted_records = 1;
+}
+
+// EventualReplicationService periodically exchanges each replica's current
+// maximal register versions. Repeated delivery is expected and idempotent.
+service EventualReplicationService {
+  rpc Gossip(GossipRequest) returns (GossipResponse);
+}

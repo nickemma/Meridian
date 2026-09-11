@@ -1,0 +1,120 @@
+syntax = "proto3";
+
+package meridian.kv;
+
+option go_package = "github.com/nickemma/meridian/proto/kv";
+
+// Consistency is supplied for every operation. The server validates it against
+// immutable namespace policy once causal and eventual paths are available.
+enum Consistency {
+  CONSISTENCY_UNSPECIFIED = 0;
+  CONSISTENCY_STRONG = 1;
+  CONSISTENCY_CAUSAL = 2;
+  CONSISTENCY_EVENTUAL = 3;
+}
+
+// CausalContext is intentionally present in v1 requests. Strong clients leave
+// it empty; causal clients will carry both a version-vector frontier and the
+// highest Raft index on which an operation depends.
+message CausalContext {
+  bytes vector_clock = 1;
+  uint64 raft_index = 2;
+  // The immutable namespace-policy revision observed by the client. Causal and
+  // eventual writes reject a stale revision rather than crossing a path change.
+  uint64 policy_version = 3;
+}
+
+message VersionedValue {
+  bytes value = 1;
+  bool tombstone = 2;
+  CausalContext context = 3;
+}
+
+message GetRequest {
+  string request_id = 1;
+  bytes key = 2;
+  Consistency consistency = 3;
+  CausalContext context = 4;
+  int64 deadline_unix_nano = 5;
+}
+
+message GetResponse {
+  bool found = 1;
+  bytes value = 2;
+  Consistency served_consistency = 3;
+  CausalContext context = 4;
+  uint64 raft_index = 5;
+  // Causal and eventual multi-value registers return every concurrent maximal
+  // version here. The legacy found/value fields are populated only for a single
+  // non-tombstoned version.
+  repeated VersionedValue versions = 6;
+}
+
+message PutRequest {
+  string request_id = 1;
+  bytes key = 2;
+  bytes value = 3;
+  Consistency consistency = 4;
+  CausalContext context = 5;
+  int64 deadline_unix_nano = 6;
+}
+
+message PutResponse {
+  uint64 raft_index = 1;
+  Consistency served_consistency = 2;
+  CausalContext context = 3;
+}
+
+message DeleteRequest {
+  string request_id = 1;
+  bytes key = 2;
+  Consistency consistency = 3;
+  CausalContext context = 4;
+  int64 deadline_unix_nano = 5;
+}
+
+message DeleteResponse {
+  uint64 raft_index = 1;
+  Consistency served_consistency = 2;
+  CausalContext context = 3;
+}
+
+message CompareAndSetRequest {
+  string request_id = 1;
+  bytes key = 2;
+  bool expected_exists = 3;
+  bytes expected_value = 4;
+  bytes value = 5;
+  Consistency consistency = 6;
+  CausalContext context = 7;
+  int64 deadline_unix_nano = 8;
+}
+
+message CompareAndSetResponse {
+  bool swapped = 1;
+  bytes current_value = 2;
+  bool current_exists = 3;
+  uint64 raft_index = 4;
+  Consistency served_consistency = 5;
+  CausalContext context = 6;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  string node_id = 1;
+  string role = 2;
+  uint64 term = 3;
+  string leader_id = 4;
+  uint64 commit_index = 5;
+  uint64 last_applied = 6;
+  bool storage_healthy = 7;
+}
+
+service KVService {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc CompareAndSet(CompareAndSetRequest) returns (CompareAndSetResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+}

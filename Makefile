@@ -1,8 +1,25 @@
-.PHONY: all build run test proto cluster-up cluster-down clean fmt
+.PHONY: all build build-storageffi build-load build-check run test storage-build test-storage-ffi test-strong-integration check-history proto cluster-up cluster-down clean fmt
 
 # Build the main node binary
 build:
 	go build -o bin/meridian ./cmd/meridian
+
+# Build a runnable node linked to the Rust LSM state machine.
+build-storageffi: storage-build
+	go build -tags storageffi -o bin/meridian ./cmd/meridian
+
+# Build the development workload driver and bounded history checker.
+build-load:
+	go build -o bin/meridian-load ./cmd/meridian-load
+
+build-check:
+	go build -o bin/meridian-check ./cmd/meridian-check
+
+# Verify a small successful strong-operation history emitted by meridian-load.
+# Usage: make check-history HISTORY=results/trial-1.jsonl
+check-history:
+	@test -n "$(HISTORY)" || (echo "HISTORY is required" >&2; exit 2)
+	go run ./cmd/meridian-check -history "$(HISTORY)"
 
 # Run the node locally (single node, no cluster)
 run:
@@ -11,6 +28,19 @@ run:
 # Run all tests
 test:
 	go test ./... -v -race
+
+# Build the Rust static library consumed by the optional Go storage adapter.
+storage-build:
+	cargo build --manifest-path storage-engine/Cargo.toml --release
+
+# Run the real Go-to-Rust storage integration tests.
+test-storage-ffi: storage-build
+	go test -tags storageffi ./internal/storage -v -race
+
+# Exercise leader election, client RPCs, Raft replication, and Rust state
+# machine application in one live three-node process test.
+test-strong-integration: storage-build
+	go test -tags storageffi ./internal/server -v -race -run TestStrongKVOverLiveThreeNodeCluster
 
 # Generate Go code from all .proto file
 proto:

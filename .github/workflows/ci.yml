@@ -61,3 +61,26 @@ jobs:
       - name: Lint
         working-directory: storage-engine
         run: cargo clippy -- -D warnings
+
+  storage-ffi-integration:
+    name: Storage FFI Integration
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.87"
+
+      - name: Test Go to Rust storage boundary
+        run: |
+          make test-storage-ffi
+          make test-strong-integration

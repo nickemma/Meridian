@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -118,5 +120,59 @@ func TestApplyLoop_NeverAppliesBeyondCommitIndex(t *testing.T) {
 	// Must stop at 3 — entries 4 and 5 are not committed
 	if n.state.LastApplied() != 3 {
 		t.Errorf("expected lastApplied 3, got %d", n.state.LastApplied())
+	}
+}
+
+type failingStateMachine struct{}
+
+func (failingStateMachine) Apply(uint64, []byte) error {
+	return errors.New("durable storage unavailable")
+}
+
+func TestApplyLoopDoesNotAdvanceAfterStateMachineFailure(t *testing.T) {
+	n := newLeaderNode("node-1", []string{"node-2", "node-3"})
+	n.stateMachine = failingStateMachine{}
+	n.state.AppendEntry(n.state.CurrentTerm(), []byte("command"))
+	n.state.SetCommitIndex(1)
+
+	n.applyCommitted()
+
+	if got := n.state.LastApplied(); got != 0 {
+		t.Errorf("last applied = %d, want 0 after failed apply", got)
+	}
+}
+
+func TestSubmitAndWaitReturnsAfterCommittedCommandIsApplied(t *testing.T) {
+	n := newLeaderNode("node-1", []string{"node-2", "node-3"})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	type result struct {
+		index uint64
+		err   error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		index, err := n.SubmitAndWait(ctx, []byte("command"))
+		resultCh <- result{index: index, err: err}
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for n.state.LastLogIndex() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("submit did not append its command")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	n.state.SetCommitIndex(1)
+	n.applyCommitted()
+
+	select {
+	case got := <-resultCh:
+		if got.err != nil || got.index != 1 {
+			t.Errorf("SubmitAndWait = (%d, %v), want (1, nil)", got.index, got.err)
+		}
+	case <-ctx.Done():
+		t.Fatal("SubmitAndWait did not return after apply")
 	}
 }

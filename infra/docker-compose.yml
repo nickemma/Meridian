@@ -14,6 +14,7 @@ services:
             MERIDIAN_CLIENT_PORT: "8080"
             MERIDIAN_DATA_DIR: /var/lib/meridian
             MERIDIAN_PEERS: node-2:9090,node-3:9090
+            MERIDIAN_POLICIES: /strong/:strong:1,/causal/:causal:2,/eventual/:eventual:3
         ports:
             - "9091:9090" # raft port exposed to host as 9091
             - "8081:8080" # client port exposed to host as 8081
@@ -38,6 +39,7 @@ services:
             MERIDIAN_CLIENT_PORT: "8080"
             MERIDIAN_DATA_DIR: /var/lib/meridian
             MERIDIAN_PEERS: node-1:9090,node-3:9090
+            MERIDIAN_POLICIES: /strong/:strong:1,/causal/:causal:2,/eventual/:eventual:3
         ports:
             - "9092:9090"
             - "8082:8080"
@@ -62,6 +64,7 @@ services:
             MERIDIAN_CLIENT_PORT: "8080"
             MERIDIAN_DATA_DIR: /var/lib/meridian
             MERIDIAN_PEERS: node-1:9090,node-2:9090
+            MERIDIAN_POLICIES: /strong/:strong:1,/causal/:causal:2,/eventual/:eventual:3
         ports:
             - "9093:9090"
             - "8083:8080"

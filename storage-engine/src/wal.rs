@@ -141,6 +141,24 @@ impl Wal {
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence
     }
+
+    /// Discard entries that have been materialized in a durably published
+    /// SSTable. The caller must hold the engine write lock and must publish and
+    /// sync that SSTable before calling this method.
+    pub fn reset(&mut self) -> io::Result<()> {
+        self.writer.flush()?;
+        self.writer.get_ref().sync_all()?;
+
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.path)?;
+        file.sync_all()?;
+
+        let file = OpenOptions::new().append(true).open(&self.path)?;
+        self.writer = BufWriter::new(file);
+        Ok(())
+    }
 }
 
 fn checksum(data: &[u8]) -> u32 {

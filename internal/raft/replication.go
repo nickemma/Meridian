@@ -13,6 +13,9 @@ import (
 func (n *Node) handleAppendEntries(
 	req *pb.AppendEntriesRequest,
 ) *pb.AppendEntriesResponse {
+	n.protocolMu.Lock()
+	defer n.protocolMu.Unlock()
+
 	currentTerm := n.state.CurrentTerm()
 
 	// Rule 1 — reject if leader's term is behind ours.
@@ -23,9 +26,15 @@ func (n *Node) handleAppendEntries(
 		}
 	}
 
-	// Rule 2 — if we see a higher or equal term from a valid leader,
-	// update our term and step down to Follower.
+	// Rule 2 — a candidate that receives a current-term leader heartbeat must
+	// step down. A higher term additionally resets its recorded vote.
 	if req.Term > currentTerm {
+		n.state.BecomeFollower(req.Term)
+		if err := n.state.DurabilityError(); err != nil {
+			log.Printf("[raft] %s cannot persist term %d: %v", n.state.NodeID(), req.Term, err)
+			return &pb.AppendEntriesResponse{Term: currentTerm, Success: false}
+		}
+	} else if req.Term == currentTerm && n.state.GetRole() == Candidate {
 		n.state.BecomeFollower(req.Term)
 	}
 
@@ -49,12 +58,12 @@ func (n *Node) handleAppendEntries(
 		}
 		if entry.Term != req.PrevLogTerm {
 			// We have an entry at prevLogIndex but its term doesn't match.
-			// This is a conflict — truncate from this point and let the
-			// leader retry with an earlier prevLogIndex.
+			// Reject it and let the leader retry with an earlier prefix. A
+			// follower must never discard a suffix merely because an RPC was
+			// rejected: the conflicting entry could already be committed.
 			log.Printf("[raft] %s rejecting AppendEntries — term mismatch at index %d"+
 				" (have %d, leader has %d)",
 				n.state.NodeID(), req.PrevLogIndex, entry.Term, req.PrevLogTerm)
-			n.state.TruncateFrom(req.PrevLogIndex)
 			return &pb.AppendEntriesResponse{
 				Term:    n.state.CurrentTerm(),
 				Success: false,
@@ -74,14 +83,10 @@ func (n *Node) handleAppendEntries(
 			}
 		}
 
-		// If we already have entries beyond prevLogIndex that conflict
-		// with the new ones, truncate them first.
-		// Then append the new entries.
-		if req.PrevLogIndex < n.state.LastLogIndex() {
-			n.state.TruncateFrom(req.PrevLogIndex + 1)
+		if err := n.state.MergeEntriesFromLeader(req.PrevLogIndex, entries); err != nil {
+			log.Printf("[raft] %s cannot merge replicated entries: %v", n.state.NodeID(), err)
+			return &pb.AppendEntriesResponse{Term: n.state.CurrentTerm(), Success: false}
 		}
-
-		n.state.AppendEntries(entries)
 
 	}
 
@@ -94,15 +99,23 @@ func (n *Node) handleAppendEntries(
 			newCommit = n.state.LastLogIndex()
 		}
 		n.state.SetCommitIndex(newCommit)
+		if err := n.state.DurabilityError(); err != nil {
+			log.Printf("[raft] %s cannot persist commit index %d: %v", n.state.NodeID(), newCommit, err)
+			return &pb.AppendEntriesResponse{Term: n.state.CurrentTerm(), Success: false}
+		}
+		n.notifyApply(newCommit)
 
 		log.Printf("[raft] %s advanced commit index to %d",
 			n.state.NodeID(), newCommit)
 	}
 
 	return &pb.AppendEntriesResponse{
-		Term:       n.state.CurrentTerm(),
-		Success:    true,
-		MatchIndex: n.state.LastLogIndex(),
+		Term:    n.state.CurrentTerm(),
+		Success: true,
+		// This response confirms only the prefix in this request. Returning
+		// LastLogIndex would wrongly tell a new leader that an unrelated
+		// uncommitted follower suffix also matched its log.
+		MatchIndex: req.PrevLogIndex + uint64(len(req.Entries)),
 	}
 }
 
@@ -110,6 +123,9 @@ func (n *Node) handleAppendEntries(
 // Called by the leader after appending a new client command.
 // Also called on each heartbeat tick to catch up lagging followers.
 func (n *Node) replicateEntries(ctx context.Context) {
+	n.replicationMu.Lock()
+	defer n.replicationMu.Unlock()
+
 	var wg sync.WaitGroup
 
 	for _, peer := range n.peers {
@@ -168,6 +184,9 @@ func (n *Node) replicateToPeer(ctx context.Context, peer *PeerClient) {
 		// Peer has higher term — we are a stale leader, step down.
 		if resp.Term > n.state.CurrentTerm() {
 			n.state.BecomeFollower(resp.Term)
+			if err := n.state.DurabilityError(); err != nil {
+				log.Printf("[raft] %s cannot persist higher term %d: %v", n.state.NodeID(), resp.Term, err)
+			}
 			n.electionTimer.Reset()
 			return
 		}

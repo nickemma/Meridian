@@ -2,7 +2,95 @@ package raft
 
 import (
 	"testing"
+	"time"
+
+	"github.com/nickemma/meridian/internal/config"
 )
+
+func TestPersistentStateSurvivesRestart(t *testing.T) {
+	store, err := NewFileStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("create state store: %v", err)
+	}
+	state, err := NewStateFromStore("node-1", store)
+	if err != nil {
+		t.Fatalf("open persistent state: %v", err)
+	}
+	state.BecomeCandidate()
+	state.AppendEntry(state.CurrentTerm(), []byte("first"))
+	state.AppendEntry(state.CurrentTerm(), []byte("second"))
+	state.SetCommitIndex(2)
+	state.SetLastApplied(1)
+	if err := state.DurabilityError(); err != nil {
+		t.Fatalf("persist state: %v", err)
+	}
+
+	restarted, err := NewStateFromStore("node-1", store)
+	if err != nil {
+		t.Fatalf("restart persistent state: %v", err)
+	}
+	if restarted.CurrentTerm() != 1 || restarted.VotedFor() != "node-1" {
+		t.Fatalf("recovered hard state = term:%d vote:%q", restarted.CurrentTerm(), restarted.VotedFor())
+	}
+	if restarted.LastLogIndex() != 2 || restarted.CommitIndex() != 2 || restarted.LastApplied() != 1 {
+		t.Fatalf("recovered indexes = log:%d commit:%d applied:%d", restarted.LastLogIndex(), restarted.CommitIndex(), restarted.LastApplied())
+	}
+	entry, found := restarted.EntryAt(2)
+	if !found || string(entry.Command) != "second" {
+		t.Fatalf("recovered log entry = %+v, found:%t", entry, found)
+	}
+}
+
+func TestPersistentStateRejectsInvalidRecoveryData(t *testing.T) {
+	store, err := NewFileStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("create state store: %v", err)
+	}
+	if err := store.Save(PersistentState{CommitIndex: 1}); err == nil {
+		t.Fatal("invalid state save succeeded")
+	}
+}
+
+type recordingStateMachine struct {
+	entries []uint64
+}
+
+func (m *recordingStateMachine) Apply(index uint64, _ []byte) error {
+	m.entries = append(m.entries, index)
+	return nil
+}
+
+func TestDurableNodeRecoversAndAppliesCommittedEntry(t *testing.T) {
+	cfg := &config.Config{
+		NodeID:             "node-1",
+		DataDir:            t.TempDir(),
+		ElectionTimeoutMin: time.Second,
+		ElectionTimeoutMax: time.Second,
+	}
+	node, err := NewDurableNode(cfg, NoopStateMachine{})
+	if err != nil {
+		t.Fatalf("create durable node: %v", err)
+	}
+	node.state.BecomeCandidate()
+	node.state.AppendEntry(node.state.CurrentTerm(), []byte("committed"))
+	node.state.SetCommitIndex(1)
+	if err := node.state.DurabilityError(); err != nil {
+		t.Fatalf("persist committed entry: %v", err)
+	}
+
+	machine := &recordingStateMachine{}
+	restarted, err := NewDurableNode(cfg, machine)
+	if err != nil {
+		t.Fatalf("restart durable node: %v", err)
+	}
+	restarted.applyCommitted()
+	if len(machine.entries) != 1 || machine.entries[0] != 1 {
+		t.Fatalf("applied entries = %v, want [1]", machine.entries)
+	}
+	if got := restarted.state.LastApplied(); got != 1 {
+		t.Fatalf("last applied = %d, want 1", got)
+	}
+}
 
 func TestNewState_InitialValues(t *testing.T) {
 	s := NewState("node-1")

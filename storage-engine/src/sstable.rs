@@ -1,12 +1,14 @@
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::memtable::Value;
 
 // u32::MAX is our on-disk tombstone marker.
 // A value_len of u32::MAX means "this key was deleted".
 const TOMBSTONE_MARKER: u32 = u32::MAX;
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A single entry read back from an SSTable.
 #[derive(Debug, Clone)]
@@ -38,11 +40,30 @@ impl SSTable {
     /// Memtable::into_sorted_entries() which guarantees this.
     pub fn write(path: impl AsRef<Path>, entries: Vec<(Vec<u8>, Value)>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SSTable path has no parent directory",
+            )
+        })?;
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SSTable path is not valid UTF-8",
+                )
+            })?;
+        let temp_path = parent.join(format!(
+            ".{filename}.{}.{}.tmp",
+            std::process::id(),
+            TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         let file = OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .write(true)
-            .truncate(true)
-            .open(&path)?;
+            .open(&temp_path)?;
         let mut writer = BufWriter::new(file);
 
         let mut index: Vec<IndexEntry> = Vec::with_capacity(entries.len());
@@ -91,6 +112,14 @@ impl SSTable {
         // to know where the index starts.
         writer.write_all(&index_offset.to_le_bytes())?;
         writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+
+        // rename is atomic within one directory. The file contents are synced
+        // first, then the directory entry is synced before callers discard the
+        // corresponding WAL records.
+        fs::rename(&temp_path, &path)?;
+        File::open(parent)?.sync_all()?;
 
         Ok(Self { path, index })
     }
