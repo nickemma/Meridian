@@ -1,4 +1,4 @@
-.PHONY: all build build-storageffi build-load build-check run test storage-build test-storage-ffi test-strong-integration check-history proto cluster-up cluster-down clean fmt
+.PHONY: all build build-storageffi build-load build-openload build-check build-staleness run test storage-build test-storage-ffi test-strong-integration check-history proto cluster-up cluster-down baselines-up baselines-down clean fmt
 
 # Build the main node binary
 build:
@@ -12,8 +12,16 @@ build-storageffi: storage-build
 build-load:
 	go build -o bin/meridian-load ./cmd/meridian-load
 
+# Build the open-loop driver used for latency-under-offered-load trials.
+build-openload:
+	go build -o bin/meridian-openload ./cmd/meridian-openload
+
 build-check:
 	go build -o bin/meridian-check ./cmd/meridian-check
+
+# Build the conservative client-observable staleness analyzer.
+build-staleness:
+	go build -o bin/meridian-staleness ./cmd/meridian-staleness
 
 # Verify a small successful strong-operation history emitted by meridian-load.
 # Usage: make check-history HISTORY=results/trial-1.jsonl
@@ -58,6 +66,12 @@ cluster-up:
 # Tear down the cluster
 cluster-down:
 	docker compose -f infra/docker-compose.yml down -v
+
+baselines-up:
+	docker compose -f infra/baselines-compose.yml up -d
+
+baselines-down:
+	docker compose -f infra/baselines-compose.yml down -v
 
 # Stream logs from all 3 nodes
 cluster-logs:

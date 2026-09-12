@@ -14,7 +14,9 @@ import (
 	"github.com/nickemma/meridian/internal/consistency"
 	kv "github.com/nickemma/meridian/proto/kv"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 type testNodeAddress struct {
@@ -103,12 +105,18 @@ func TestStrongKVOverLiveThreeNodeCluster(t *testing.T) {
 	if !get.Found || string(get.Value) != "value" || get.RaftIndex < put.RaftIndex {
 		t.Fatalf("strong get = found:%t value:%q index:%d, put index:%d", get.Found, get.Value, get.RaftIndex, put.RaftIndex)
 	}
-	causalStrong, err := client.Get(operationCtx, &kv.GetRequest{RequestId: "causal-strong-get", Key: []byte("/strong/item"), Consistency: kv.Consistency_CONSISTENCY_CAUSAL})
+	causalStrong, err := client.Get(operationCtx, &kv.GetRequest{RequestId: "causal-strong-get", Key: []byte("/strong/item"), Consistency: kv.Consistency_CONSISTENCY_CAUSAL, Context: &kv.CausalContext{RaftIndex: put.RaftIndex, PolicyVersion: 1}})
 	if err != nil {
 		t.Fatalf("causal read of materialized strong value: %v", err)
 	}
 	if !causalStrong.Found || string(causalStrong.Value) != "value" || causalStrong.ServedConsistency != kv.Consistency_CONSISTENCY_CAUSAL {
 		t.Fatalf("causal strong read = %#v", causalStrong)
+	}
+	if _, err := client.Put(operationCtx, &kv.PutRequest{RequestId: "eventual-on-strong", Key: []byte("/strong/item"), Value: []byte("invalid"), Consistency: kv.Consistency_CONSISTENCY_EVENTUAL, Context: &kv.CausalContext{PolicyVersion: 1}}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("eventual write to strong key error = %v, want FailedPrecondition", err)
+	}
+	if _, err := client.Put(operationCtx, &kv.PutRequest{RequestId: "strong-on-eventual", Key: []byte("/eventual/item"), Value: []byte("invalid"), Consistency: kv.Consistency_CONSISTENCY_STRONG, Context: &kv.CausalContext{PolicyVersion: 3}}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("strong write to eventual key error = %v, want FailedPrecondition", err)
 	}
 	eventualStrong, err := client.Get(operationCtx, &kv.GetRequest{RequestId: "eventual-strong-get", Key: []byte("/strong/item"), Consistency: kv.Consistency_CONSISTENCY_EVENTUAL})
 	if err != nil {

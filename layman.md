@@ -62,17 +62,32 @@ one, and can make a strong update visible to weaker reads after the Raft entry
 has applied.
 
 The project has real unit tests, a Rust-backed three-node integration test, and
-small local Docker smoke runs. These demonstrate that the pieces work together.
+small local Docker smoke runs. It also has a running three-member etcd
+comparison cluster and a Cassandra startup environment. These demonstrate that
+the pieces can be run and checked; they are not performance results.
 
 ## 6. What it does **not** prove yet
 
 It does not yet prove that Meridian is faster than existing databases, safe
 under every failure, or ready for production. Those claims require larger fault
-tests, an independent checker, WAN-style measurements, and comparisons with
-systems such as etcd and Cassandra. The project documents those remaining
-steps instead of substituting estimates for evidence.
+tests, an independent checker, WAN-style measurements, a Meridian YCSB binding,
+and repeated comparisons with systems such as etcd and Cassandra. The project
+documents those remaining steps instead of substituting estimates for evidence.
 
-## 7. A defensive way to describe the project
+## 7. What the comparison setup means
+
+Meridian is being compared with two established systems for different reasons.
+
+| System | Why it is included | What it cannot prove |
+|---|---|---|
+| etcd | A mature three-member system that keeps each update strongly ordered. | Whether Meridian's causal or eventual paths are better. |
+| Cassandra | A system that lets an application choose a replica-consistency level. | That a Cassandra `QUORUM` request is automatically the same as Meridian's strong path. |
+
+The comparison setup is readying the laboratory. Five repeated trials, a fair
+dataset, and recorded network conditions are still needed before any chart or
+claim is presented.
+
+## 8. A defensive way to describe the project
 
 Use this wording:
 
@@ -87,7 +102,7 @@ If someone asks why it is useful, explain that many applications already treat
 ticket sales, carts, and page views differently. Meridian makes that decision
 explicit in one system and measures the cost of doing so.
 
-## 8. A one-minute walkthrough
+## 9. A one-minute walkthrough
 
 1. A customer reserves inventory under `/strong/`; Meridian waits for a
    majority before saying yes.

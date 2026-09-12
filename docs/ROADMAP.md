@@ -122,8 +122,8 @@ flowchart TD
 - [x] Define causal record envelopes containing value/tombstone, version vector, dependencies, origin, and policy version.
 - [x] Implement causal replication messages, durable replica snapshots, duplicate suppression, and dependency wait queues. Durable outbox retry remains open.
 - [x] Expose a causal value only when the local vector frontier and required Raft index dominate the client context.
-- [ ] Implement timeout behavior for unavailable dependencies; never return a dependency-violating value as success.
-- [ ] Add property tests with reordered, duplicated, and delayed messages, plus a real three-node dependency-chain test.
+- [x] Implement context-bounded waiting for unavailable causal and Raft dependencies; expiry returns `DEADLINE_EXCEEDED` and never exposes a dependency-violating value.
+- [x] Add replica property tests with reordered and duplicated dependency chains. A real three-node dependency-chain fault trial remains open.
 
 **Exit:** A client that reads `x`, writes dependent `y`, and later causally reads `y` cannot observe `y` without the version of `x` it depended on. Concurrent causal writes are exposed as concurrent versions, not silently serialized.
 
@@ -137,7 +137,7 @@ flowchart TD
 - [x] Implement multi-value-register merge and tombstone propagation. Resolving writes and garbage-collection preconditions remain open.
 - [x] Return observed versions and replication metadata on eventual reads; do not infer “fresh” from local wall-clock time alone.
 - [ ] Track per-peer lag, pending bytes, last successful exchange, sibling count, and convergence time.
-- [ ] Add partition/heal tests that verify convergence and preservation of concurrent siblings.
+- [x] Add replica-level partition/heal tests that verify convergence and preservation of concurrent siblings. A live network-partition trial remains open.
 
 **Exit:** During a partition, writes to a predeclared eventual namespace succeed on both sides. After healing, every replica converges to the same maximal version set, and the raw history explains every returned version.
 
@@ -148,9 +148,9 @@ flowchart TD
 - [x] Implement longest-prefix namespace lookup and validate the policy version on writes.
 - [x] Enforce same-path reads and writes by namespace class. Weaker reads of strong namespaces are admitted only after local materialization.
 - [x] Materialize a locally applied strong version into causal and eventual registers with its Raft index. Independently delayed dissemination queues remain open.
-- [ ] Extend client context so a causal request depending on a Raft operation waits for the required local applied index.
+- [x] Extend client context so a causal request depending on a Raft operation waits for the required local applied index.
 - [x] Implement causal and eventual reads of a strong key as explicitly weaker responses. Independent weak-path propagation delay remains open.
-- [ ] Reject concurrent strong and eventual writes to one key before mutation, including retries against stale policy metadata.
+- [x] Reject cross-class writes to one key before mutation through immutable policy admission; stale policy versions are rejected. Durable retry de-duplication remains open.
 - [ ] Add end-to-end tests for every case in Section 4.4 of [`research.md`](research.md).
 - [ ] Emit a metric for requested class, served class, rejected class mismatch, dependency wait, and dissemination lag.
 
@@ -176,9 +176,9 @@ flowchart TD
 **Goal:** Produce real, reproducible Q1–Q3 evidence.
 
 - [ ] Implement and publish YCSB bindings for the Meridian client API; preserve standard A, B, C, D, and F semantics rather than silently remapping unsupported operations.
-- [ ] Build a separate open-loop workload driver for latency-under-load and the mixed storefront workload in [`research.md`](research.md).
+- [x] Build an open-loop driver for latency-under-load and the fixed mixed storefront manifest. Histories include version/context and CAS outcome fields; fault markers remain open.
 - [x] Generate one raw operation record per request from the closed-loop development driver; the final open-loop schema remains open.
-- [ ] Implement the staleness oracle: version staleness, time staleness, acknowledgement-to-visibility delay, and explicit treatment of concurrent writes.
+- [~] Implement a conservative history-based staleness analyzer: it identifies missed non-concurrent writes and reports a lower-bound time lag while excluding concurrent weak writes. Acknowledgement-to-visibility delay and a full version-staleness distribution remain open.
 - [x] Add a parameterized `tc netem` helper. Topology manifests and recorded RTT-derived profiles remain open.
 - [ ] Pin and smoke-test etcd and Cassandra configurations. Report Cassandra's actual consistency contract rather than calling ordinary `QUORUM` operations linearizable.
 - [ ] Run five paired trials for every retained configuration, preserve all raw data, and generate tables and timeline plots from scripts.

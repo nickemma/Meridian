@@ -12,16 +12,21 @@ import (
 )
 
 type operation struct {
-	Sequence  uint64 `json:"sequence"`
-	Kind      string `json:"kind"`
-	Class     string `json:"class"`
-	Key       string `json:"key"`
-	Invoked   int64  `json:"invoked_unix_nano"`
-	Completed int64  `json:"completed_unix_nano"`
-	Outcome   string `json:"outcome"`
-	Found     bool   `json:"found,omitempty"`
-	Value     string `json:"value_base64,omitempty"`
-	Returned  string `json:"returned_value_base64,omitempty"`
+	Sequence       uint64 `json:"sequence"`
+	Kind           string `json:"kind"`
+	Class          string `json:"class"`
+	Key            string `json:"key"`
+	Invoked        int64  `json:"invoked_unix_nano"`
+	Completed      int64  `json:"completed_unix_nano"`
+	Outcome        string `json:"outcome"`
+	Found          bool   `json:"found,omitempty"`
+	Value          string `json:"value_base64,omitempty"`
+	Returned       string `json:"returned_value_base64,omitempty"`
+	Expected       string `json:"expected_value_base64,omitempty"`
+	ExpectedExists bool   `json:"expected_exists"`
+	Swapped        bool   `json:"swapped,omitempty"`
+	Current        string `json:"current_value_base64,omitempty"`
+	CurrentExists  bool   `json:"current_exists"`
 }
 
 type result struct {
@@ -81,7 +86,7 @@ func load(path string) ([]operation, error) {
 		if err := json.Unmarshal(scanner.Bytes(), &operation); err != nil {
 			return nil, fmt.Errorf("decode history: %w", err)
 		}
-		if operation.Class == "strong" && operation.Outcome == "ok" && (operation.Kind == "get" || operation.Kind == "put") {
+		if operation.Class == "strong" && operation.Outcome == "ok" && (operation.Kind == "get" || operation.Kind == "put" || operation.Kind == "compare_and_set") {
 			operations = append(operations, operation)
 		}
 	}
@@ -129,15 +134,26 @@ func (c *checker) hasPredecessor(index int, remaining uint64) bool {
 }
 
 func legal(operation operation, state map[string]value) bool {
-	if operation.Kind != "get" {
+	current := state[operation.Key]
+	switch operation.Kind {
+	case "get":
+		return current.found == operation.Found && (!current.found || current.data == operation.Returned)
+	case "compare_and_set":
+		matches := current.found == operation.ExpectedExists
+		if matches && current.found {
+			matches = current.data == operation.Expected
+		}
+		if operation.Swapped != matches {
+			return false
+		}
+		return operation.Swapped || (current.found == operation.CurrentExists && (!current.found || current.data == operation.Current))
+	default:
 		return true
 	}
-	current := state[operation.Key]
-	return current.found == operation.Found && (!current.found || current.data == operation.Returned)
 }
 
 func apply(operation operation, state map[string]value) {
-	if operation.Kind == "put" {
+	if operation.Kind == "put" || (operation.Kind == "compare_and_set" && operation.Swapped) {
 		state[operation.Key] = value{found: true, data: operation.Value}
 	}
 }

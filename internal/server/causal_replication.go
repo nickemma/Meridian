@@ -55,18 +55,18 @@ func registerEventualReplicationService(server grpc.ServiceRegistrar, replica *e
 }
 
 func (s *eventualReplicationService) Gossip(_ context.Context, request *pb.GossipRequest) (*pb.GossipResponse, error) {
-	var accepted uint32
+	records := make([]consistency.Record, 0, len(request.GetRecords()))
 	for index, message := range request.GetRecords() {
 		record, err := recordFromProto(message)
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "decode gossip record %d: %v", index, err)
 		}
-		if err := s.replica.Receive(record); err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "receive gossip record %d: %v", index, err)
-		}
-		accepted++
+		records = append(records, record)
 	}
-	return &pb.GossipResponse{AcceptedRecords: accepted}, nil
+	if err := s.replica.ReceiveAll(records); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "receive gossip batch: %v", err)
+	}
+	return &pb.GossipResponse{AcceptedRecords: uint32(len(records))}, nil
 }
 
 func recordFromProto(message *pb.ReplicatedRecord) (consistency.Record, error) {

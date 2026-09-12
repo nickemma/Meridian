@@ -195,8 +195,10 @@ func (n *Node) replicateToPeer(ctx context.Context, peer *PeerClient) {
 			// Peer accepted — update our tracking for this peer.
 			n.state.SetMatchIndex(peer.ID(), resp.MatchIndex)
 			n.state.SetNextIndex(peer.ID(), resp.MatchIndex+1)
-			log.Printf("[raft] %s replicated to %s up to index %d",
-				n.state.NodeID(), peer.ID(), resp.MatchIndex)
+			if len(entries) > 0 {
+				log.Printf("[raft] %s replicated to %s up to index %d",
+					n.state.NodeID(), peer.ID(), resp.MatchIndex)
+			}
 
 			// Recalculate commit index now that this peer has confirmed.
 			n.advanceCommitIndex()

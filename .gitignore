@@ -1,5 +1,6 @@
 bin/
 *.pb.go
+third_party/
 
 # Python virtual env
 choas/venv/

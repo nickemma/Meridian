@@ -46,7 +46,36 @@ make cluster-down
 `cluster-down` removes the Compose volumes. Do not use it when you intend to
 keep local data.
 
-## 3. Namespace policies
+Prometheus starts with the cluster on `localhost:9099`. Grafana is optional so
+an existing service on port 3000 cannot prevent the store from starting:
+
+```bash
+docker compose -f infra/docker-compose.yml --profile observability up -d grafana
+```
+
+## 3. External baseline services
+
+The pinned etcd and Cassandra references are isolated from Meridian:
+
+```bash
+make baselines-up
+docker compose -f infra/baselines-compose.yml ps
+make baselines-down
+```
+
+etcd v3.5.18 exposes a three-member client endpoint set on ports `23791`–
+`23793`; its quorum health check has passed locally. Cassandra 4.1.8 exposes
+CQL on `localhost:9042`. Its Compose service is a startup and schema smoke
+environment only. It does not yet provide the three replicas required for a
+meaningful `ONE`/`QUORUM` comparison.
+
+YCSB source is pinned locally at version 0.17.0, commit
+`4b19340e3bab5e4c88eda75ad56e83dc4d5cc503`. A Meridian YCSB binding and
+retained baseline trials remain unfinished. Cassandra is a per-consistency-level
+reference, not a linearizability baseline; record its selected consistency level
+with every trial.
+
+## 4. Namespace policies
 
 Each key belongs to one immutable, longest-prefix policy. The Compose setup
 installs these policies:
@@ -67,7 +96,7 @@ The format is `prefix:class:version`, separated by commas. Prefixes must be
 `/` or end in `/`. A write must use the exact class and policy version assigned
 to its key. A mismatch returns gRPC `FAILED_PRECONDITION` before mutation.
 
-## 4. Smoke-test the API
+## 5. Smoke-test the API
 
 Use the included closed-loop driver after identifying the leader. For example,
 if node-2 is leader:
@@ -90,9 +119,12 @@ go run ./cmd/meridian-load \
 ```
 
 `meridian-check` is exhaustive for its bounded single-register input. It is a
-development smoke checker, not a substitute for a large-history checker.
+development smoke checker, not a substitute for a large-history checker. Start
+from an empty data directory or include initialization writes in the retained
+history; otherwise a conditional update can correctly observe state that the
+checker has no record of.
 
-## 5. gRPC contract
+## 6. gRPC contract
 
 The canonical schema is [`proto/kv/kv.proto`](proto/kv/kv.proto). The service
 is `meridian.kv.KVService`:
@@ -118,7 +150,7 @@ version is also reflected in `found` and `value`. Multiple entries mean
 concurrent values exist; a caller must resolve them with a later write rather
 than choosing one silently.
 
-## 6. Go client example
+## 7. Go client example
 
 Generated types are in `github.com/nickemma/meridian/proto/kv`.
 
@@ -164,7 +196,7 @@ defer cluster.Close()
 response, err := cluster.Put(ctx, strongPutRequest)
 ```
 
-## 7. Error handling
+## 8. Error handling
 
 | Code | Meaning | Client action |
 |---|---|---|
@@ -174,11 +206,47 @@ response, err := cluster.Put(ctx, strongPutRequest)
 | `DeadlineExceeded` | Client or request deadline elapsed | Record the ambiguous outcome before deciding whether to retry. |
 | `Internal` | Local storage or replication-path failure | Treat as failed; preserve the operation record for diagnosis. |
 
-## 8. Current limits
+## 9. Open-loop research driver
+
+Build the driver, then run the fixed mixed workload against all three nodes:
+
+```bash
+make build-openload
+mkdir -p results/mixed-smoke
+./bin/meridian-openload \
+  -targets localhost:8081,localhost:8082,localhost:8083 \
+  -workload bench/workloads/mixed.json \
+  -duration 30s \
+  -rate 100 \
+  -max-inflight 128 \
+  -raw results/mixed-smoke/history.jsonl \
+  2>results/mixed-smoke/summary.json
+```
+
+The JSONL file retains scheduled, invoked, and completed times for every
+request, returned versions, response context, Raft index, and conditional-write
+outcomes. Analyze a completed history with:
+
+```bash
+make build-staleness
+./bin/meridian-staleness -history results/mixed-smoke/history.jsonl \
+  >results/mixed-smoke/staleness.json
+```
+
+The analyzer reports only staleness that the client history can establish. It
+excludes concurrent weak writes and reports a lower-bound elapsed time from a
+missed write's completion to the response; it does not claim a propagation
+delay or a universal total order. The driver and analyzer are harness tools;
+follow the protocol in
+[`docs/research.md`](docs/research.md) before treating its output as a result.
+
+## 10. Current limits
 
 Meridian is a research prototype. It has functional three-node and Docker smoke
-coverage, but it does not yet have retained WAN trials, external baselines,
-staleness analysis, a scalable history checker, TLS, authentication, or a
+coverage, a healthy local three-member etcd reference deployment, and a
+Cassandra startup environment. It does not yet have retained WAN trials,
+completed external-baseline measurements, an acknowledgement-to-visibility
+staleness measure, a scalable history checker, TLS, authentication, or a
 production recovery/backup procedure. See [`docs/research.md`](docs/research.md)
 and [`docs/ROADMAP.md`](docs/ROADMAP.md) before making performance or safety
 claims.

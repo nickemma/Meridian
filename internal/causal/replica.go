@@ -6,10 +6,12 @@ package causal
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/nickemma/meridian/internal/consistency"
 )
@@ -134,6 +136,21 @@ func (r *Replica) Write(key, value []byte, tombstone bool, dependencies consiste
 	return clone(record), nil
 }
 
+// WriteContext waits for the dependencies named by a client context to become
+// locally visible. It returns the caller's deadline error instead of accepting
+// a dependency-violating write when the dependency never arrives.
+func (r *Replica) WriteContext(ctx context.Context, key, value []byte, tombstone bool, dependencies consistency.VersionVector, raftIndex, policyVersion uint64) (consistency.Record, error) {
+	for {
+		record, err := r.Write(key, value, tombstone, dependencies, raftIndex, policyVersion)
+		if !errors.Is(err, ErrUnsatisfiedDependencies) {
+			return record, err
+		}
+		if err := waitForContext(ctx); err != nil {
+			return consistency.Record{}, err
+		}
+	}
+}
+
 // Receive accepts a replicated record. Safe records are applied immediately;
 // records whose dependencies are missing are retained until a later Receive or
 // ObserveRaft makes them safe. Receiving the same record repeatedly is
@@ -201,6 +218,30 @@ func (r *Replica) Read(key []byte, required consistency.VersionVector, raftIndex
 		result.Values[index] = clone(value)
 	}
 	return result, nil
+}
+
+// ReadContext waits for required causal and Raft dependencies to become
+// locally visible. It is deliberately a bounded wait: success never exposes a
+// value ahead of a named dependency, and expiry is visible to the caller.
+func (r *Replica) ReadContext(ctx context.Context, key []byte, required consistency.VersionVector, raftIndex uint64) (Snapshot, error) {
+	for {
+		snapshot, err := r.Read(key, required, raftIndex)
+		if !errors.Is(err, ErrUnsatisfiedDependencies) {
+			return snapshot, err
+		}
+		if err := waitForContext(ctx); err != nil {
+			return Snapshot{}, err
+		}
+	}
+}
+
+func waitForContext(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(time.Millisecond):
+		return nil
+	}
 }
 
 func (r *Replica) Pending() int {

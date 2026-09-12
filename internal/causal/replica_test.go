@@ -1,8 +1,10 @@
 package causal
 
 import (
+	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/nickemma/meridian/internal/consistency"
 )
@@ -55,6 +57,44 @@ func TestReplicaHoldsReorderedRecordUntilDependencyArrives(t *testing.T) {
 	}
 }
 
+func TestReplicaConvergesWithReorderedDuplicateDependencyChain(t *testing.T) {
+	origin, err := NewReplica("origin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := origin.Write([]byte("/causal/a"), []byte("one"), false, nil, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := origin.Write([]byte("/causal/b"), []byte("two"), false, first.Version, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := origin.Write([]byte("/causal/c"), []byte("three"), false, second.Version, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target, err := NewReplica("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range []consistency.Record{third, second, third, first, second, first} {
+		if _, err := target.Receive(record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, key := range [][]byte{[]byte("/causal/a"), []byte("/causal/b"), []byte("/causal/c")} {
+		got, err := target.Read(key, nil, 0)
+		if err != nil || len(got.Values) != 1 {
+			t.Fatalf("Read(%q) = (%#v, %v)", key, got, err)
+		}
+	}
+	if target.Pending() != 0 {
+		t.Fatalf("pending records = %d, want 0", target.Pending())
+	}
+}
+
 func TestReplicaEnforcesClientAndRaftDependencies(t *testing.T) {
 	replica, err := NewReplica("a")
 	if err != nil {
@@ -74,6 +114,33 @@ func TestReplicaEnforcesClientAndRaftDependencies(t *testing.T) {
 	}
 	if record.RaftIndex != 4 {
 		t.Fatalf("RaftIndex = %d, want 4", record.RaftIndex)
+	}
+}
+
+func TestReadContextWaitsForRaftDependencyOrDeadline(t *testing.T) {
+	replica, err := NewReplica("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := replica.ReadContext(deadline, []byte("/strong/k"), nil, 1); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ReadContext missing dependency error = %v, want deadline exceeded", err)
+	}
+
+	ready, cancelReady := context.WithTimeout(context.Background(), time.Second)
+	defer cancelReady()
+	result := make(chan error, 1)
+	go func() {
+		_, err := replica.ReadContext(ready, []byte("/strong/k"), nil, 2)
+		result <- err
+	}()
+	time.Sleep(5 * time.Millisecond)
+	if err := replica.ObserveRaft(2); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; err != nil {
+		t.Fatalf("ReadContext did not unblock after Raft apply: %v", err)
 	}
 }
 

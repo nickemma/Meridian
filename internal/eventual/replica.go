@@ -108,17 +108,33 @@ func (r *Replica) Write(key, value []byte, tombstone bool, policyVersion uint64)
 // over the set of received versions, so eventually every connected replica
 // reaches the same maximal sibling set.
 func (r *Replica) Receive(record consistency.Record) error {
-	if err := consistency.ValidateRecord(record); err != nil {
-		return err
+	return r.ReceiveAll([]consistency.Record{record})
+}
+
+// ReceiveAll merges one anti-entropy batch as a single durable transition.
+// Periodic gossip carries every currently maximal record. Checkpointing after
+// each element would make a full-state round quadratic in storage work and can
+// starve the Raft RPC service that shares the process.
+func (r *Replica) ReceiveAll(records []consistency.Record) error {
+	for _, record := range records {
+		if err := consistency.ValidateRecord(record); err != nil {
+			return err
+		}
+		if len(record.Dependencies) != 0 {
+			return fmt.Errorf("eventual record must not carry causal dependencies")
+		}
 	}
-	if len(record.Dependencies) != 0 {
-		return fmt.Errorf("eventual record must not carry causal dependencies")
+	if len(records) == 0 {
+		return nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	previous := r.snapshotLocked()
-	if err := r.applyLocked(record); err != nil {
-		return err
+	for _, record := range records {
+		if err := r.applyLocked(record); err != nil {
+			r.restoreLocked(previous)
+			return err
+		}
 	}
 	return r.checkpointOrRestoreLocked(previous)
 }

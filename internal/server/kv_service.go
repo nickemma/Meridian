@@ -37,8 +37,10 @@ func registerKVService(server grpc.ServiceRegistrar, node *raft.Node, store raft
 }
 
 func (s *kvService) Get(ctx context.Context, request *kv.GetRequest) (*kv.GetResponse, error) {
+	ctx, cancel := requestDeadline(ctx, request.GetDeadlineUnixNano())
+	defer cancel()
 	if request.GetConsistency() == kv.Consistency_CONSISTENCY_CAUSAL {
-		return s.getCausal(request)
+		return s.getCausal(ctx, request)
 	}
 	if request.GetConsistency() == kv.Consistency_CONSISTENCY_EVENTUAL {
 		return s.getEventual(request)
@@ -63,8 +65,10 @@ func (s *kvService) Get(ctx context.Context, request *kv.GetRequest) (*kv.GetRes
 }
 
 func (s *kvService) Put(ctx context.Context, request *kv.PutRequest) (*kv.PutResponse, error) {
+	ctx, cancel := requestDeadline(ctx, request.GetDeadlineUnixNano())
+	defer cancel()
 	if request.GetConsistency() == kv.Consistency_CONSISTENCY_CAUSAL {
-		return s.putCausal(request)
+		return s.putCausal(ctx, request)
 	}
 	if request.GetConsistency() == kv.Consistency_CONSISTENCY_EVENTUAL {
 		return s.putEventual(request)
@@ -89,8 +93,10 @@ func (s *kvService) Put(ctx context.Context, request *kv.PutRequest) (*kv.PutRes
 }
 
 func (s *kvService) Delete(ctx context.Context, request *kv.DeleteRequest) (*kv.DeleteResponse, error) {
+	ctx, cancel := requestDeadline(ctx, request.GetDeadlineUnixNano())
+	defer cancel()
 	if request.GetConsistency() == kv.Consistency_CONSISTENCY_CAUSAL {
-		return s.deleteCausal(request)
+		return s.deleteCausal(ctx, request)
 	}
 	if request.GetConsistency() == kv.Consistency_CONSISTENCY_EVENTUAL {
 		return s.deleteEventual(request)
@@ -115,6 +121,8 @@ func (s *kvService) Delete(ctx context.Context, request *kv.DeleteRequest) (*kv.
 }
 
 func (s *kvService) CompareAndSet(ctx context.Context, request *kv.CompareAndSetRequest) (*kv.CompareAndSetResponse, error) {
+	ctx, cancel := requestDeadline(ctx, request.GetDeadlineUnixNano())
+	defer cancel()
 	if err := validateStrongRequest(request.GetRequestId(), request.GetKey(), request.GetConsistency(), request.GetDeadlineUnixNano()); err != nil {
 		return nil, err
 	}
@@ -147,7 +155,7 @@ func (s *kvService) CompareAndSet(ctx context.Context, request *kv.CompareAndSet
 	return &kv.CompareAndSetResponse{Swapped: true, CurrentExists: true, CurrentValue: request.GetValue(), RaftIndex: index, ServedConsistency: kv.Consistency_CONSISTENCY_STRONG}, nil
 }
 
-func (s *kvService) getCausal(request *kv.GetRequest) (*kv.GetResponse, error) {
+func (s *kvService) getCausal(ctx context.Context, request *kv.GetRequest) (*kv.GetResponse, error) {
 	context, err := validateCausalRequest(request.GetRequestId(), request.GetKey(), request.GetContext(), request.GetDeadlineUnixNano())
 	if err != nil {
 		return nil, err
@@ -159,7 +167,7 @@ func (s *kvService) getCausal(request *kv.GetRequest) (*kv.GetResponse, error) {
 	if policy.Class != consistency.Causal && policy.Class != consistency.Strong {
 		return nil, status.Errorf(codes.FailedPrecondition, "causal reads are not materialized for %s namespace %s", policy.Class, policy.Prefix)
 	}
-	snapshot, err := s.causal.Read(request.GetKey(), context.Vector, context.RaftIndex)
+	snapshot, err := s.causal.ReadContext(ctx, request.GetKey(), context.Vector, context.RaftIndex)
 	if err != nil {
 		return nil, causalError(err)
 	}
@@ -176,7 +184,7 @@ func (s *kvService) getCausal(request *kv.GetRequest) (*kv.GetResponse, error) {
 	return response, nil
 }
 
-func (s *kvService) putCausal(request *kv.PutRequest) (*kv.PutResponse, error) {
+func (s *kvService) putCausal(ctx context.Context, request *kv.PutRequest) (*kv.PutResponse, error) {
 	context, err := validateCausalRequest(request.GetRequestId(), request.GetKey(), request.GetContext(), request.GetDeadlineUnixNano())
 	if err != nil {
 		return nil, err
@@ -185,7 +193,7 @@ func (s *kvService) putCausal(request *kv.PutRequest) (*kv.PutResponse, error) {
 	if err != nil {
 		return nil, policyError(err)
 	}
-	record, err := s.causal.Write(request.GetKey(), request.GetValue(), false, context.Vector, context.RaftIndex, policy.Version)
+	record, err := s.causal.WriteContext(ctx, request.GetKey(), request.GetValue(), false, context.Vector, context.RaftIndex, policy.Version)
 	if err != nil {
 		return nil, causalError(err)
 	}
@@ -195,7 +203,7 @@ func (s *kvService) putCausal(request *kv.PutRequest) (*kv.PutResponse, error) {
 	return &kv.PutResponse{ServedConsistency: kv.Consistency_CONSISTENCY_CAUSAL, Context: causalContext(record.Version, record.RaftIndex, policy.Version)}, nil
 }
 
-func (s *kvService) deleteCausal(request *kv.DeleteRequest) (*kv.DeleteResponse, error) {
+func (s *kvService) deleteCausal(ctx context.Context, request *kv.DeleteRequest) (*kv.DeleteResponse, error) {
 	context, err := validateCausalRequest(request.GetRequestId(), request.GetKey(), request.GetContext(), request.GetDeadlineUnixNano())
 	if err != nil {
 		return nil, err
@@ -204,7 +212,7 @@ func (s *kvService) deleteCausal(request *kv.DeleteRequest) (*kv.DeleteResponse,
 	if err != nil {
 		return nil, policyError(err)
 	}
-	record, err := s.causal.Write(request.GetKey(), nil, true, context.Vector, context.RaftIndex, policy.Version)
+	record, err := s.causal.WriteContext(ctx, request.GetKey(), nil, true, context.Vector, context.RaftIndex, policy.Version)
 	if err != nil {
 		return nil, causalError(err)
 	}
@@ -350,11 +358,24 @@ func policyVersion(context *kv.CausalContext) uint64 {
 	return context.GetPolicyVersion()
 }
 
+func requestDeadline(ctx context.Context, unixNano int64) (context.Context, context.CancelFunc) {
+	if unixNano <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithDeadline(ctx, time.Unix(0, unixNano))
+}
+
 func policyError(err error) error {
 	return status.Errorf(codes.FailedPrecondition, "namespace policy: %v", err)
 }
 
 func causalError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return status.FromContextError(err).Err()
+	}
+	if errors.Is(err, context.Canceled) {
+		return status.FromContextError(err).Err()
+	}
 	if errors.Is(err, causal.ErrUnsatisfiedDependencies) {
 		return status.Errorf(codes.FailedPrecondition, "causal dependency unavailable locally: %v", err)
 	}
