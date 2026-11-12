@@ -1,6 +1,6 @@
 # Meridian Architecture
 
-**Status:** In Development
+**Status:** Design document for the target system (April 2026). Several components described here — WebAssembly policy sandboxing, WAL encryption, mTLS, snapshot compaction — are not built. See the [project status table](../README.md#project-status) for what exists.
 **Last Updated:** April 2026
 **Author:** [@nickemma](https://github.com/nickemma)
 

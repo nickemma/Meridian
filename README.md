@@ -1,52 +1,96 @@
-# Meridian — Distributed Secrets & Consistency Platform
+# Meridian — Per-Request Consistency over a Shared Keyspace
 
 <div align="center">
 
-![Status](https://img.shields.io/badge/status-In%20development-orange)
-![Go Version](https://img.shields.io/badge/go-1.25-blue)
+![Status](https://img.shields.io/badge/status-research%20prototype-orange)
+![Go Version](https://img.shields.io/badge/go-1.26-blue)
 ![Rust Version](https://img.shields.io/badge/rust-1.87-orange)
 ![Python Version](https://img.shields.io/badge/python-3.12-blue)
 ![License](https://img.shields.io/badge/license-APACHE-green)
 [![CI](https://github.com/nickemma/meridian/workflows/CI/badge.svg)](https://github.com/nickemma/meridian/actions)
 
-**A geo-distributed key-value store and secrets management platform — built from first principles.**
+**A geo-distributed key-value store in which the replication mechanism is chosen per request — Raft for strong, vector-clock dependency tracking for causal, asynchronous gossip for eventual — over one keyspace and one storage engine.**
 
-_Tunable consistency per request. Strongly consistent secret writes. WASM-sandboxed policy enforcement. ML-powered access anomaly detection. Every component chaos-tested._
-
-[Architecture](#architecture) • [Design Doc](docs/DESIGN_DOC.md) • [Runbook](docs/RUNBOOK.md) • [Tradeoffs](docs/TRADEOFFS.md) • [Roadmap](#roadmap)
+[Project status](#project-status) • [Research protocol](docs/research.md) • [API and run guide](API.md) • [Roadmap](docs/ROADMAP.md)
 
 </div>
 
 ---
 
-## What is Meridian?
+## The question
 
-Meridian is two things collapsed into one, because they belong together.
+Choosing consistency per operation is established prior work. Dynamo-style stores vary read and write quorums, Pileus selects replicas against consistency–latency SLAs, and RedBlue consistency separates operations by whether they need a common order. In each case, one replication design is varied by a parameter.
 
-At the bottom: a geo-distributed key-value store where consistency is a per-request choice, backed by a from-scratch Raft consensus engine and a Rust LSM storage layer. A client that needs a bank balance uses strong consistency. A client that needs a shopping cart uses causal consistency. A client that needs a session cache uses eventual consistency. The same cluster serves all three correctly, simultaneously.
+Meridian runs three **structurally different** mechanisms over the same keys. That raises questions a quorum parameter never does:
 
-At the top: a production-grade secrets and policy enforcement platform. Services authenticate to Meridian to fetch credentials, certificates, and API keys. Meridian enforces who can access what via a WASM-sandboxed policy engine. It rotates secrets automatically, detects access anomalies with an ML model, and writes a tamper-evident audit trail of every decision.
+- What is a client promised when a key written through consensus is read through gossip?
+- Is a Raft-committed dependency visible to a causal read, and what does the read do while it is not?
+- What resolves a race between a strong write and an eventual one?
+- Does the flexibility pay — against the best fixed mechanism that still satisfies every operation — and what does it cost when a deployment uses only one path?
 
-The reason they are one system: secrets management is a distributed storage problem. Strong consistency guarantees that a rotated credential is visible to all services before the old one is revoked. Partition tolerance guarantees that a network split does not prevent services from authenticating. Tunable consistency guarantees that a sidecar fetching a cached secret does not pay the cost of a quorum read every time. The Raft consensus engine is not a library dependency — it is the foundation. Every secret write goes through it. Every lease is backed by it. Every audit record is committed to it.
-
-**The real question this system answers:** What happens when a service tries to fetch a database credential during a network partition? Meridian has a specific, tested, verifiable answer. Most secrets managers do not.
+[`docs/research.md`](docs/research.md) fixes the cross-mechanism contract, hypotheses, baselines, workloads and acceptance gates **before** any measurement, so results cannot be retrofitted to the design. No performance result is claimed yet.
 
 ---
 
-## What Each Layer Proves
+## Project status
 
-| Layer | What It Demonstrates |
+Every component is listed with its real state. Vocabulary: **Working** · **Partial** (what is missing, in one clause) · **Designed, not built**.
+
+### Distributed key-value core
+
+| Component | State |
 |---|---|
-| Raft consensus from scratch | Distributed systems depth — leader election, log replication, safety properties, pre-vote extension |
-| Rust LSM storage engine | Systems programming, storage internals, WAL durability, SSTable compaction, no GC on the write path |
-| Tunable consistency per request | You understand when linearizability matters and when it is overhead |
-| Secrets + rotation + lease management | Production platform thinking, zero-trust credential lifecycle |
-| WASM-sandboxed policy engine | Security architecture, sandboxed evaluation, OPA-equivalent without the dependency |
-| mTLS + node identity verification | Zero-trust networking from the cluster layer upward |
-| ML access anomaly detection | Behavioral baseline, runtime enforcement, not just static policy |
-| Chaos suite on secret access | The compelling demo — correctness under adversarial conditions, not just happy paths |
-| Tamper-evident audit trail | You think about correctness and operability and compliance |
-| Prometheus + Grafana observability | SRE ownership — the system is not built until it is observable |
+| Raft — leader election, log replication, commit rules, durable hard state | **Working** — unit tests plus a live three-node leader-stop / restart / catch-up integration test |
+| Raft — pre-vote extension | **Working** — unit tests |
+| Raft — log compaction / snapshots | Designed, not built |
+| Rust LSM engine — WAL, memtable, SSTables, tombstones, crash recovery | **Working** — 25 Rust tests; used by Go through a C ABI |
+| LSM compaction | **Partial** — explicit full compaction only; no leveled or background compaction |
+| LSM bloom filters | Designed, not built |
+| WAL encryption at rest | Designed, not built |
+| Strong path | **Working** — reads use a committed no-op barrier, not ReadIndex (the extra log entry is a known cost) |
+| Causal path | **Working** — vector clocks plus applied-Raft-index dependency checks; reads wait until their deadline, then return `DEADLINE_EXCEEDED` rather than expose a value ahead of its dependency |
+| Eventual path | **Working** — multi-value registers, immediate async push, 250 ms anti-entropy retransmit; concurrent siblings returned to the client |
+| Cross-mechanism contract | **Partial** — one write class per namespace is enforced and strong writes are materialized for weak reads; namespace policies are fixed at startup (not Raft-installed) and there is no durable gossip outbox |
+| Client API (`Get` / `Put` / `Delete` / `CompareAndSet` / `Status`) and leader-aware Go client | **Working** |
+| Inter-node TLS / authentication | Designed, not built — peer gRPC is currently plaintext |
+
+### Verification and measurement tooling
+
+| Component | State |
+|---|---|
+| Linearizability checker (`cmd/meridian-check`) | **Partial** — exhaustive search over bounded single-register histories; a smoke checker, not a large-history checker |
+| Closed-loop load driver (`cmd/meridian-load`) | **Working** — JSONL operation histories and percentile summaries |
+| Open-loop driver (`cmd/meridian-openload`) | **Working** — schedules the pre-registered mixed workload at a target offered rate |
+| Staleness analysis (`cmd/meridian-staleness`) | **Partial** — lower-bound staleness from histories; no acknowledgement-to-visibility measure |
+| Chaos suite (`chaos/`) | **Partial** — node kill, partition and clock-skew scenarios against the Docker cluster; no retained runs |
+| Prometheus metrics | **Working** — 17 metrics per node on `client port + 1000`; Grafana is an optional Compose profile with no provisioned dashboards |
+| External baselines (etcd, Cassandra) | **Partial** — reference deployments start; no measurements |
+| Evaluation (research questions Q1–Q3) | Not run |
+
+### Secrets and policy layer
+
+These packages exist with unit tests but are **not yet mounted on the running node** — a package is not counted as shipped until it is reachable through the real client path.
+
+| Component | State |
+|---|---|
+| Secret store — versioning, rotation with grace period, leases with TTL | **Partial** — in-process library with Raft-ready command encoding; not wired into the node |
+| Policy engine — deny-by-default, contextual rules (identity, path, action, source IP, time) | **Partial** — evaluated natively in Go; not wired into the node |
+| Policy sandboxing in WebAssembly, policy DSL compiler | Designed, not built |
+| Audit log — SHA-256 hash chain with verifier | **Partial** — library; not yet committed through Raft |
+| Access anomaly detection | **Partial** — rule-based per-identity detector (request-rate threshold over a 5-minute window, unseen source IP, unseen path); library only |
+| Dynamic per-service credentials | Designed, not built |
+
+---
+
+## What testing has found
+
+Building the live three-node leader-failover test exposed three Raft defects that unit tests had not:
+
+1. **Concurrent vote handlers could grant two votes in one term** — a safety violation that can elect two leaders. State-changing Raft RPCs are now serialized (`TestHandleRequestVoteGrantsAtMostOneVotePerTerm`).
+2. **Overlapping replication rounds could transiently separate a follower's commit index from its log.** Replicated suffixes are now merged atomically.
+3. **A heartbeat could acknowledge an unrelated follower suffix.** The leader now counts only the prefix confirmed by an `AppendEntries` request.
+
+Each has a regression test. Details: [`docs/research.md` §5.5](docs/research.md#55-september-11-implementation-update).
 
 ---
 
@@ -54,425 +98,109 @@ The reason they are one system: secrets management is a distributed storage prob
 
 ![Meridian Architecture](/docs/meridian-diagram.png)
 
----
+The diagram shows the target system, including the secrets layer. The tables above say which parts of it are built.
 
-## The Four Pillars
+**Request flow.** A client names a consistency class on each request. Namespaces are bound to one write class at startup (`/strong/`, `/causal/`, `/eventual/` in the development cluster); a write to the wrong class is rejected with `FAILED_PRECONDITION` and no mutation.
 
-### 1. Distributed Core — `core/`
+- **Strong** — the request enters the Raft log on the leader. A strong read commits a no-op barrier before answering.
+- **Causal** — the request carries a vector-clock context. A replica exposes a value only once its dependencies, including any Raft index, have been applied locally.
+- **Eventual** — the request is applied to a multi-value register and disseminated by gossip; concurrent writes are returned as siblings rather than silently resolved.
 
-The engine beneath everything. Raft consensus implemented from scratch in Go. A Rust LSM storage engine with a write-ahead log, memtable, and SSTable compaction. Tunable consistency per request — not as a configuration flag, but as a per-request protocol decision backed by the correct mechanism at each level.
-
-- **Strong consistency** via quorum reads and writes through Raft — linearizable, verifiable
-- **Causal consistency** via vector clocks — monotonic reads, causality preserved across writes
-- **Eventual consistency** via async gossip replication — maximum availability, stale reads flagged explicitly
-- **Pre-vote Raft extension** — partitioned nodes cannot disrupt a stable cluster on reconnect
-- **Jepsen-style linearizability checker** — operation histories are mathematically verified, not assumed correct
-
-Every secret write goes through the strong consistency path. Lease renewals go through causal. Cached credential reads go through eventual. The cluster makes this possible because the consistency model is per-request, not cluster-wide.
-
-### 2. Secrets & Credential Management — `secrets/`
-
-A self-hosted alternative to HashiCorp Vault, backed by your own consensus engine instead of etcd.
-
-- **Secret storage** — API keys, database credentials, TLS certificates, service tokens, stored as strongly consistent KV entries
-- **Automatic rotation** — credentials rotate on a configurable schedule or on-demand; old versions remain accessible for a grace period, then are revoked
-- **Lease management** — every credential access grants a lease with a TTL; leases are tracked in the Raft log and must be renewed or they expire
-- **Secret versioning** — full history of every version, who created it, when it was rotated, and what accessed each version
-- **Dynamic credentials** — database credentials generated on-demand per service, not shared static passwords
-
-The rotation event is a strongly consistent write. When a credential is rotated, the new
-version is committed to a quorum *before* the old version is scheduled for revocation, and
-the old version remains valid for a configurable grace period so that clients holding it are
-never broken by someone else's rotation.
-
-The guarantee is therefore the inverse of the obvious one, and stronger: **there is no window
-in which neither version is valid.** A client that fetched a credential a second before a
-rotation, on a node that has not yet seen the new version, still holds something that works.
-Both-valid is a bounded, deliberate overlap; neither-valid is an outage, and the ordering of
-the commit is what rules it out.
-
-### 3. Policy Enforcement — `policy/`
-
-An OPA-equivalent policy engine, WASM-sandboxed, embedded in every node.
-
-- **Policy evaluation in WASM** — policies are compiled to WebAssembly and evaluated in a sandbox; a malformed or malicious policy cannot affect the node process
-- **Rego-compatible policy language** — policies are written in a Rego-inspired DSL and compiled to WASM at policy upload time
-- **Contextual evaluation** — policies receive the full request context: service identity (from mTLS cert), requested secret path, source IP, time of day, previous access history
-- **Policy versioning and rollback** — policies are stored as strongly consistent KV entries; rollback is a strongly consistent write
-- **Deny-by-default** — a service with no matching policy cannot access any secret; explicit grant is required
-
-Every secret access is a policy decision. Policy evaluation is synchronous and on the read path — a service that cannot satisfy policy is rejected before the secret is read from storage.
-
-### 4. Observability & Security — `observability/` + `audit/`
-
-A system beneath everything else must be fully observable and tamper-evident.
-
-- **Tamper-evident audit trail** — every access decision (allow or deny), every secret write, every policy change, every rotation is appended to an audit log committed through Raft; entries cannot be modified without breaking the log's hash chain
-- **Access anomaly detection** — per-identity behavioral baselines over <the features: access
-  rate, path diversity, hour-of-day distribution, source IP set>. Deviation is scored by
-  <the statistic — e.g. an EWMA with a z-score threshold, or a Mahalanobis distance over the
-  feature vector>, tuned to <the false-positive rate you accepted> over a
-  <MERIDIAN_ANOMALY_BASELINE_WINDOW_HOURS>-hour window. Above threshold: alert, and optionally
-  auto-deny. Quarantine is reversible and audited — an identity wrongly flagged is a bug with
-  a paper trail, not a mystery.
-
-  The method is deliberately simple. A per-identity EWMA with a tuned threshold is defensible
-  in a review; a model nobody can explain is a liability in the one conversation where it
-  matters.
-- **Prometheus metrics** — replication lag, consensus latency, quorum health, secret access rate per service, policy evaluation latency, anomaly detection score per identity
-- **Grafana dashboards** — cluster health, per-node write throughput, consistency level distribution, secret rotation status, lease expiry queue depth
-- **Structured access logs** — every request logged with service identity, requested path, policy decision, consistency level, and latency
+After a strong write applies, its record is materialized into the weak-path registers so a causal or eventual read of a strongly written key returns a version that carries its Raft index.
 
 ---
 
-## Tech Stack
+## Quick start
 
-| Layer | Technology | Why |
-|---|---|---|
-| **Consensus + API + Secrets** | Go | Goroutine-per-peer Raft, gRPC server, lease management, secrets lifecycle |
-| **Storage Engine** | Rust | LSM tree write performance, WAL durability, no GC on the write path |
-| **Policy Engine** | Go + WASM (wasmtime) | Sandboxed evaluation, policy cannot affect node process |
-| **Anomaly Detection** | Go (embedded ML) | No external dependency, behavioral baseline per service identity |
-| **Chaos + Verification** | Python | Flexible orchestration, history analysis, linearizability checking |
-| **Inter-node + Client API** | gRPC + Protobuf | Typed, efficient, bidirectional streaming for log replication |
-| **Local Cluster** | Docker + docker-compose | Multi-node simulation, controlled network partitions via iptables |
-| **Observability** | Prometheus + Grafana | Replication lag, quorum health, secret access rates, anomaly scores |
-
----
-
-## Security as First Principles
-
-- **mTLS between all cluster nodes** — no plaintext inter-node traffic; node identity is verified at every connection before any message is processed
-- **Service identity via mTLS certificates** — services authenticate to Meridian with a certificate, not a password; the certificate identity is the subject of every policy decision
-- **WASM-sandboxed policy evaluation** — policies run in a WebAssembly sandbox; evaluation cannot escape into the node process
-- **WAL encrypted at rest** — AES-256-GCM; storage files are not plaintext on disk
-- **Tamper-evident audit log** — each audit record includes a hash of the previous record; the chain cannot be silently modified
-- **Node identity verification before cluster join** — a node cannot join the cluster by knowing the address; it must present a valid cluster certificate
-- **Deny-by-default policy** — no implicit access; every access is an explicit allow from a matching policy
-- **Lease-bound access** — every credential access is time-bounded; leaked credentials expire without manual revocation
-
----
-
-## Quick Start
-
-### Prerequisites
-
-- Go 1.25
-- Rust 1.87 (storage engine)
-- Python 3.12 (chaos orchestrator + linearizability checker)
-- Docker + docker-compose (multi-node cluster)
+Prerequisites: Go 1.26, Rust 1.87, Python 3.12 (chaos suite), Docker with Compose.
 
 ```bash
-# Clone
 git clone https://github.com/nickemma/meridian.git
 cd meridian
 
-# Start a 3-node local cluster
+# Unit tests (Go, race detector) and the Rust storage engine
+make test
+cd storage-engine && cargo test && cd ..
+
+# Live three-node strong-path integration test (leader stop, restart, catch-up)
+make test-strong-integration
+
+# Start a three-node cluster: client gRPC on :8081–8083, metrics on :9081–9083
 make cluster-up
 
-# Verify cluster health
-./bin/meridian-cli cluster status
-# Node 1 (leader):   healthy  term=1  commit_index=0
-# Node 2 (follower): healthy  term=1  commit_index=0
-# Node 3 (follower): healthy  term=1  commit_index=0
+# Smoke-test the strong path against the leader, then check the history
+go run ./cmd/meridian-load -target localhost:8082 -consistency strong \
+  -policy-version 1 -operations 16 -concurrency 1 -read-percent 50 \
+  -raw /tmp/strong-history.jsonl
+go run ./cmd/meridian-check -history /tmp/strong-history.jsonl -limit 20
 
-# Write a secret (strong consistency — committed to quorum before returning)
-./bin/meridian-cli secret put \
-  --path services/payments/db-password \
-  --value 'correct-horse-battery' \
-  --ttl 24h
-
-# Read a secret (strong consistency — quorum confirmed read)
-./bin/meridian-cli secret get \
-  --path services/payments/db-password \
-  --consistency strong
-
-# Read a cached credential (eventual — no quorum round-trip)
-./bin/meridian-cli secret get \
-  --path services/payments/db-password \
-  --consistency eventual
-
-# Check what policies apply to a service identity
-./bin/meridian-cli policy eval \
-  --identity payments-service \
-  --path services/payments/db-password \
-  --action read
-
-# Rotate a secret
-./bin/meridian-cli secret rotate --path services/payments/db-password
-
-# View the audit trail for a secret path
-./bin/meridian-cli audit log --path services/payments/db-password --last 20
-
-# Run the chaos suite (isolated Docker network — destructive)
+# Chaos scenarios (destructive; isolated Docker network)
 make chaos-run
+
+make cluster-down
 ```
 
-### Consistency Levels via gRPC
+[`API.md`](API.md) has the full run guide: finding the leader, namespace policies, the gRPC contract, a Go client example, error handling and the open-loop research driver.
 
-```protobuf
-enum ConsistencyLevel {
-  STRONG   = 0;  // Quorum read/write via Raft — linearizable. Used for all secret writes.
-  CAUSAL   = 1;  // Vector clock causality — monotonic reads. Used for lease renewals.
-  EVENTUAL = 2;  // Async — lowest latency, stale reads flagged. Used for cached reads.
-}
+---
 
-message SecretRequest {
-  string            path             = 1;
-  ConsistencyLevel  consistency      = 2;
-  bytes             vector_clock     = 3;  // Required for CAUSAL reads
-  string            lease_id         = 4;  // Present if renewing an existing lease
-}
+## Repository layout
 
-message SecretResponse {
-  bytes   value          = 1;  // Encrypted in transit
-  string  version        = 2;
-  string  lease_id       = 3;
-  int64   lease_ttl_sec  = 4;
-  bool    stale_read     = 5;  // True if serving from eventual path and behind leader
-  bytes   vector_clock   = 6;  // Return to client for subsequent causal reads
-}
-```
-
-### Policy Example
-
-```rego
-# Allow payments-service to read its own DB credentials
-# Deny after business hours from non-datacenter IPs
-
-package meridian.secrets
-
-default allow = false
-
-allow {
-  input.identity == "payments-service"
-  startswith(input.path, "services/payments/")
-  input.action == "read"
-  is_business_hours
-  is_datacenter_ip(input.source_ip)
-}
-
-is_business_hours {
-  hour := time.clock(time.now_ns())[0]
-  hour >= 6
-  hour < 22
-}
-
-is_datacenter_ip(ip) {
-  net.cidr_contains("10.0.0.0/8", ip)
-}
-```
-
-### Environment Variables
-
-```bash
-MERIDIAN_NODE_ID=1
-MERIDIAN_PEERS=node2:9090,node3:9090
-MERIDIAN_RAFT_PORT=9090
-MERIDIAN_CLIENT_PORT=8080
-MERIDIAN_DATA_DIR=/var/lib/meridian
-MERIDIAN_ELECTION_TIMEOUT_MS=300
-MERIDIAN_HEARTBEAT_INTERVAL_MS=50
-MERIDIAN_QUORUM_SIZE=2                    # for 3-node cluster
-MERIDIAN_WAL_ENCRYPTION_KEY=<32-byte-key>
-MERIDIAN_SECRET_ROTATION_GRACE_PERIOD=5m  # old version stays valid after rotation
-MERIDIAN_LEASE_DEFAULT_TTL=1h
-MERIDIAN_POLICY_WASM_MEMORY_LIMIT_MB=64
-MERIDIAN_ANOMALY_BASELINE_WINDOW_HOURS=168  # 7 days of access history for baseline
-MERIDIAN_AUDIT_HASH_CHAIN=true
+```text
+meridian/
+├─ cmd/
+│  ├─ meridian/            node binary
+│  ├─ meridian-load/       closed-loop driver
+│  ├─ meridian-openload/   open-loop driver for the pre-registered workload
+│  ├─ meridian-check/      bounded linearizability checker
+│  └─ meridian-staleness/  staleness analysis over histories
+├─ internal/
+│  ├─ raft/                consensus, pre-vote, durable state
+│  ├─ consistency/         per-request class selection and admission
+│  ├─ causal/  eventual/   weak-path replicas
+│  ├─ server/              client and peer gRPC services, Rust-backed state machine
+│  ├─ storage/  replicationstore/  config/  metrics/
+│  └─ secrets/  policy/  audit/  anomaly/   secrets layer — not yet mounted
+├─ storage-engine/         Rust LSM engine and C ABI
+├─ client/                 leader-aware Go client
+├─ proto/                  kv, raft and causal gRPC contracts
+├─ chaos/                  Python chaos orchestrator and scenarios
+├─ bench/workloads/        pre-registered mixed workload
+├─ infra/                  Docker Compose cluster, Prometheus, baselines
+└─ docs/                   research protocol, roadmap, design documents
 ```
 
 ---
 
-## Project Status
+## Documentation
 
-> **Meridian is a working system with components at different levels of maturity. This table
-> says which is which.**
-> Everything below the table is documented at full design detail regardless of state — that is
-> deliberate, and this table is how you tell the two apart. Nothing in this README is claimed
-> as shipped unless it says so here.
-
-| Component | State |
+| Document | Contents |
 |---|---|
-| Raft consensus — election, replication, safety | |
-| Raft — pre-vote extension | |
-| Raft — log compaction / snapshots | |
-| Rust LSM storage engine — WAL, memtable, SSTable | |
-| LSM — compaction, bloom filters | |
-| WAL encryption at rest (AES-256-GCM) | |
-| Tunable consistency — strong path (quorum + read index) | |
-| Tunable consistency — causal path (vector clocks) | |
-| Tunable consistency — eventual path (gossip) | |
-| Secret storage, versioning, lease management | |
-| Automatic rotation with grace period | |
-| Dynamic per-service credentials | |
-| WASM policy engine — sandbox, evaluation | |
-| Policy DSL → WASM compiler | |
-| mTLS between nodes, identity verification on join | |
-| Tamper-evident audit trail (hash chain through Raft) | |
-| Access anomaly detection | |
-| Linearizability checker | |
-| Chaos suite | |
-| Prometheus metrics + Grafana dashboards | |
-
-Suggested vocabulary, so the column is comparable across repositories:
-**Working** · **Partial** (what's missing, in one clause) · **Skeleton** · **Designed, not built**
+| [`docs/research.md`](docs/research.md) | Pre-registered research protocol: questions, cross-mechanism contract, hypotheses, baselines, gates |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Code status per area and what is missing before any research claim |
+| [`API.md`](API.md) | Run guide, gRPC contract, client example, current limits |
+| [`docs/DESIGN_DOC.md`](docs/DESIGN_DOC.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/TRADEOFFS.md`](docs/TRADEOFFS.md) | Design documents for the target system, written April 2026; they describe components that are not yet built |
+| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Operating procedures |
 
 ---
 
-## Service Level Objectives
+## Non-goals
 
-The platform is measured the way a real production dependency should be.
-
-| SLI | Definition | Target | Measured |
-|---|---|---|---|
-| **Strong-path read latency** | Quorum-confirmed secret read, p99 | < — ms | — |
-| **Strong-path write latency** | Raft commit to quorum, p99 | < — ms | — |
-| **Eventual-path read latency** | Local read, p99 | < — ms | — |
-| **Linearizability on the strong path** | Histories violating linearizability | **0** | — |
-| **Rotation safety** | Requests failing during a rotation | **0** | — |
-| **Revocation propagation** | Revocation → enforced cluster-wide, p99 | < — s | — |
-| **Availability under one node loss** | Strong-path requests served, 3-node cluster | 100% | — |
-| **Behavior under quorum loss** | Strong-path requests incorrectly served | **0 — fail closed** | — |
-| **Policy evaluation latency** | Added per access decision, p99 | < — ms | — |
-| **Audit chain integrity** | Verifier runs detecting an unexplained break | **0** | — |
-
-The zeros are invariants, not percentiles. An invariant with an error budget is not an
-invariant. `fail closed` under quorum loss is the row that defines this system's character:
-a secrets manager that serves reads it cannot confirm has stopped being a secrets manager.
+- **Not a general-purpose database.** The consistency options exist to study their composition.
+- **Not production software.** No TLS, authentication, backup or recovery procedure yet.
+- **Not highly available under quorum loss on the strong path.** Strong requests fail closed by design; weak paths keep serving with their weaker contracts.
 
 ---
 
-## Metrics
+## Related repositories
 
-Every metric is a deliberate answer to a question someone will ask at 3 a.m.
+[LATTICE](https://github.com/nickemma/lattice) — distributed search with explicit coverage under partial failure.
 
-| Metric | Type | Labels | Question it answers |
-|---|---|---|---|
-| `meridian_raft_commit_duration_seconds` | histogram | — | Is consensus the latency, or is it storage? |
-| `meridian_raft_leader_changes_total` | counter | reason | Is the cluster stable, or flapping? |
-| `meridian_raft_log_lag_entries` | gauge | peer | Which follower is behind, and by how much? |
-| `meridian_quorum_available` | gauge | — | Can we serve the strong path at all right now? |
-| `meridian_request_duration_seconds` | histogram | consistency, op | What does each consistency level actually cost? |
-| `meridian_stale_reads_total` | counter | identity | How much staleness are clients actually accepting? |
-| `meridian_secret_access_total` | counter | identity, path_prefix, decision | Who is reading what? |
-| `meridian_policy_eval_duration_seconds` | histogram | policy_version | Is policy on the read path costing what we said? |
-| `meridian_policy_denials_total` | counter | identity, reason | Is a policy wrong, or is someone probing? |
-| `meridian_lease_active` | gauge | identity | How much access is outstanding right now? |
-| `meridian_lease_expirations_total` | counter | renewed | Are clients renewing, or leaking leases? |
-| `meridian_rotation_duration_seconds` | histogram | path | Did the last rotation actually complete? |
-| `meridian_rotation_grace_active` | gauge | path | Which secrets currently have two valid versions? |
-| `meridian_audit_chain_verifications_total` | counter | result | Has the chain ever broken? |
-| `meridian_anomaly_score` | gauge | identity | Which service is behaving unlike itself? |
-| `meridian_lsm_compaction_duration_seconds` | histogram | level | Is compaction why reads got slow? |
-| `meridian_wal_fsync_duration_seconds` | histogram | — | Is the disk the write-path bottleneck? |
-
-`meridian_rotation_grace_active` is the one that catches the interesting incident. A secret
-stuck in grace is a rotation that half-finished, and no other metric would show it.
-
----
-
-## Failure Mode Analysis
-
-| Failure | Blast radius | Detection | Mitigation |
-|---|---|---|---|
-| Leader dies | Writes pause for one election | `raft_leader_changes_total` | Election completes in `ELECTION_TIMEOUT_MS`; followers serve eventual reads throughout |
-| Quorum lost (2 of 3 down) | All strong-path requests | `quorum_available` = 0 | **Fail closed** on strong path; eventual path serves with `stale_read=true` |
-| Network partition, minority side | Clients on that side | Quorum failure rate | Minority refuses strong reads and writes; pre-vote prevents it disrupting the majority on reconnect |
-| Partitioned node rejoins | Would be a spurious election | Term increase without leadership loss | Pre-vote: the rejoining node cannot raise the term without winning a pre-election first |
-| Secret fetched during a partition | One service's startup | Strong-path error, explicit | Explicit quorum-unavailable error, never a silently stale credential. **This is the system's headline guarantee** |
-| Rotation interrupted mid-flight | One secret path | `rotation_grace_active` stuck | New version is committed before the old is scheduled for revocation; an interrupted rotation leaves the old version valid, never neither |
-| Lease expires during a long operation | One service | `lease_expirations_total` with `renewed=false` | Renewal is on the causal path, cheap enough to do often; expiry is a client bug with a metric |
-| Policy engine rejects a valid request | One identity | `policy_denials_total` by reason | `policy eval` explains the decision; deny-by-default means a missing policy looks identical to a hostile one, which is why the reason is recorded |
-| Malicious or malformed policy | Would be the node process | Sandbox violation counter | WASM sandbox with a memory limit; evaluation cannot escape |
-| Audit chain break | Trust in the entire record | Verifier run | Alert, freeze writes, reconcile. **Tamper-evident, not tamper-proof** — the chain proves modification, it does not prevent it |
-| WAL corruption on one node | That node's data | Checksum failure on replay | Node refuses to start; rebuilt from a peer's snapshot rather than repaired in place |
-| Clock skew across nodes | Lease TTL correctness | NTP drift metric | TTLs evaluated against a monotonic source; Raft never depends on wall time for safety |
-| Anomaly false positive | One identity, wrongly denied | Reversal rate | Auto-deny is opt-in per identity; quarantine reversible and audited |
-
-Two rows fail closed. That is the design's stance and its cost: Meridian will refuse to serve
-rather than serve something it cannot confirm. A secrets manager that prefers availability has
-chosen not to be a secrets manager.
-
----
-
-## Roadmap
-
-**V1 — Agree.** Raft from scratch · leader election · log replication · safety properties · pre-vote · snapshots
-
-**V2 — Store.** Rust LSM · WAL with fsync discipline · memtable · SSTable compaction · bloom filters · crash recovery · encryption at rest
-
-**V3 — Choose.** Tunable consistency per request — strong via quorum and read-index, causal via vector clocks, eventual via gossip · linearizability checking on the strong path
-
-**V4 — Secure.** Secret storage and versioning · leases with TTL · automatic rotation with grace · dynamic per-service credentials · mTLS and node identity verification
-
-**V5 — Decide.** WASM policy engine · policy DSL and compiler · deny-by-default · contextual evaluation · versioning and rollback
-
-**V6 — Watch.** Tamper-evident audit through Raft · access anomaly detection · Prometheus and Grafana · chaos suite as the demo
-
-**Deferred, with reasons in `LATER.md`:** multi-region replication · HSM-backed root keys · secret sharing across clusters · PKI issuance as a first-class secret type · Kubernetes operator
-
----
-
-## Non-Goals
-
-- **Not a general-purpose database.** Meridian is a KV store shaped by what secrets management needs. Its consistency options exist for credential workloads, not for yours.
-- **Not a drop-in Vault replacement.** No Vault API compatibility, no plugin ecosystem, no enterprise support. It is the layer Vault delegates, built rather than configured.
-- **Not tamper-proof.** Tamper-*evident*. Hash chaining proves modification; it does not prevent an operator with write access from attempting it.
-- **Not highly available under quorum loss.** The strong path fails closed, deliberately. If that is unacceptable for your workload, you want a cache, not a secrets manager.
-- **Not a certificate authority.** Meridian stores and rotates certificates. Issuing them is [SYNAPSE-AI](https://github.com/nickemma/synapse-ai)'s problem.
-
----
-
-## Engineering Deep Dive
-
-Key system design areas implemented in Meridian:
-
-- Raft consensus from scratch — leader election, log replication, safety properties, pre-vote extension, log compaction via snapshots
-- Tunable consistency per request — strong via quorum (read index protocol), eventual via async gossip, causal via vector clocks
-- Vector clock causality tracking — concurrent write detection, LWW conflict resolution, conflict log
-- Partition tolerance under network splits — explicit quorum unavailability errors on strong path, stale-flagged reads on eventual path
-- Rust LSM storage engine — WAL with AES-256-GCM encryption, memtable flush, SSTable compaction, bloom filters, read amplification bounds
-- Secrets management — versioning, automatic rotation with grace period, lease-bound access, strongly consistent rotation events
-- WASM-sandboxed policy engine — Rego-inspired DSL, sandboxed evaluation, deny-by-default, contextual policy decisions
-- ML access anomaly detection — behavioral baseline per service identity, deviation scoring, optional automatic enforcement
-- Tamper-evident audit trail — hash-chained records committed through Raft, end-to-end verifiable
-- Chaos testing — node kills, network partitions, clock skew, secret access under partition, Jepsen-style linearizability verification
-
-**Blog (coming soon):** _"I Merged a Distributed KV Store and a Secrets Manager Into One System. Here's Why That Makes Them Both Better."_
-
----
-
-## Layout
-
-Every dependency crossing a module boundary is an interface from that module's `ports`
-package. `internal/modules/raft/domain` imports nothing outward — the safety properties are
-arithmetic and are property-tested without a network.
-
----
-
-## One Platform, Six Repositories
-
-These are not six projects. **EMBER** fronts everything · **LATTICE** proves the distributed
-core · **MERIDIAN** provides secrets, policy, lease and audit · **VEYRONIX** consumes MERIDIAN
-and operates services · **TESSERA** is served behind EMBER and operated like VEYRONIX ·
-**SYNAPSE-AI** governs TESSERA's agents using MERIDIAN's lineage and EMBER's data plane.
-
-Meridian is the seed. Its policy engine, lease semantics, and audit lineage are what
-SYNAPSE-AI extends with AI context; its secret injection is what VEYRONIX consumes at deploy
-time.
-
-[EMBER](https://github.com/nickemma/ember) · [LATTICE](https://github.com/nickemma/lattice) ·
-[MERIDIAN](https://github.com/nickemma/meridian) · [VEYRONIX](https://github.com/nickemma/veyronix) ·
-[TESSERA](https://github.com/nickemma/tessera) · [SYNAPSE-AI](https://github.com/nickemma/synapse-ai)
-  
 ---
 
 ## Author
 
-**[@nickemma](https://github.com/nickemma)** — Building production-grade distributed systems, infrastructure, and platform engineering from first principles.
-
-💼 Open to distributed systems, infrastructure, platform, and backend engineering roles at companies building serious systems.
+**Nicholas Emmanuel** · [@nickemma](https://github.com/nickemma)
 
 <div align="center">
 <a href="https://www.linkedin.com/in/techieemma/"><img src="https://img.shields.io/badge/linkedin-%23f78a38.svg?style=for-the-badge&logo=linkedin&logoColor=white" alt="Linkedin"></a>
@@ -480,14 +208,4 @@ time.
 <a href="https://github.com/nickemma/"><img src="https://img.shields.io/badge/github-%23f78a38.svg?style=for-the-badge&logo=github&logoColor=white" alt="Github"></a>
 <a href="https://techieemma.medium.com/"><img src="https://img.shields.io/badge/Medium-%23f78a38.svg?style=for-the-badge&logo=Medium&logoColor=white" alt="Medium"></a>
 <a href="mailto:nicholasemmanuel321@gmail.com"><img src="https://img.shields.io/badge/Gmail-f78a38?style=for-the-badge&logo=gmail&logoColor=white" alt="Gmail"></a>
-</div>
-
----
-
-<div align="center">
-
-**Building Systems, Building Faith — One Commit at a Time**
-
-[⬆ Back to Top](#meridian--distributed-secrets--consistency-platform)
-
 </div>

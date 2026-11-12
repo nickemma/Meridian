@@ -199,6 +199,14 @@ The full study remains achievable as a new implementation and evaluation effort;
 
 Three dated decisions keep the work honest. By September 27, gates G1 and G2 in Appendix A must close. By October 15, gates G3 through G6 must close and the semantics in Section 4.4 must remain unchanged unless a dated amendment explains why. By October 31, the harness and both external baselines must complete a full smoke run. Missing the October 15 decision point means the three-mechanism paper cannot usefully proceed under this title; cutting Q2 does not compensate for a missing causal or eventual system. Missing only the Q2 instrumentation after the core gates close triggers the planned cut of the optionality section.
 
+### 5.7 November 2026 amendment
+
+The September 27, October 15 and October 31 decision points in §5.6 passed without gates G1–G6 closing. No implementation commits were made after September 12, 2026. Under the rule stated in §5.6, the three-mechanism evaluation does not proceed on its original schedule, and no result reported in this document should be read as having met those dates.
+
+Nothing else in the protocol changes. The research questions (§2), the cross-mechanism contract (§4.4), the hypotheses, baselines, workloads and acceptance gates (§6, Appendix A) stand as written. No new dates are set. Measurement resumes only when the gates close, in order; any change to §4.4 before then will be recorded as a further dated amendment rather than edited in place.
+
+Gate status at this amendment is recorded in a second column of the Appendix A table, separately from the original audited status, so the two can be compared.
+
 ## 6. Evaluation Protocol
 
 ### 6.1 Questions, hypotheses, and decision rules
@@ -387,17 +395,17 @@ Before a results paper is released, one immutable artifact commit must contain:
 
 The study may begin retained measurements only when all gates are checked into the artifact commit:
 
-| Gate | Acceptance condition | Audited status |
-|---|---|---|
-| G1: Client service | Remote put, get, delete, compare-and-set, and context propagation work on all nodes | Open |
-| G2: Storage integration | Committed and weak-path versions survive process restart; delete recovery passes | Open |
-| G3: Strong correctness | Durable Raft plus linearizable reads; real client histories pass the independent checker | Open |
-| G4: Causal correctness | Dependency and convergence properties pass under message reordering and partition | Open |
-| G5: Eventual correctness | Anti-entropy converges and multi-value reconciliation is deterministic | Open |
-| G6: Cross-path contract | Every Section 4.4 case passes, including rejected mixed writes | Open |
-| G7: Harness | Offered load, raw histories, per-class percentiles, and staleness oracle validate on a reference store | Open |
-| G8: Baselines | Pinned etcd and Cassandra deployments pass smoke and semantics tests | Open |
-| G9: Reproduction | Clean environment regenerates one figure from raw data | Open |
+| Gate | Acceptance condition | Audited status (Sept 10) | Status at November 2026 amendment |
+|---|---|---|---|
+| G1: Client service | Remote put, get, delete, compare-and-set, and context propagation work on all nodes | Open | Partial — KV service with put/get/delete/CAS and context propagation on all nodes (§5.5); remote durable retry semantics open |
+| G2: Storage integration | Committed and weak-path versions survive process restart; delete recovery passes | Open | Partial — durable Raft state machine and weak-path replica snapshots survive restart; delete recovery under faults not yet demonstrated |
+| G3: Strong correctness | Durable Raft plus linearizable reads; real client histories pass the independent checker | Open | Open — reads use a no-op barrier; only the bounded single-register checker exists |
+| G4: Causal correctness | Dependency and convergence properties pass under message reordering and partition | Open | Partial — reordering and duplicate delivery pass in unit tests; no live partition history |
+| G5: Eventual correctness | Anti-entropy converges and multi-value reconciliation is deterministic | Open | Partial — modelled partition and deterministic sibling preservation pass; no live anti-entropy evidence |
+| G6: Cross-path contract | Every Section 4.4 case passes, including rejected mixed writes | Open | Partial — rejected mixed writes and strong-to-weak visibility pass; remaining §4.4 cases open |
+| G7: Harness | Offered load, raw histories, per-class percentiles, and staleness oracle validate on a reference store | Open | Open |
+| G8: Baselines | Pinned etcd and Cassandra deployments pass smoke and semantics tests | Open | Open — reference deployments start; semantics tests not run |
+| G9: Reproduction | Clean environment regenerates one figure from raw data | Open | Open |
 
 Each operation record must include at least:
 

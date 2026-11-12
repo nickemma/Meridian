@@ -30,6 +30,6 @@ Out of scope: theoretical attacks without proof-of-concept, performance issues, 
 
 ## Current Status
 
-Meridian is in active development. Security features are being implemented incrementally — see the [README](../README.md) for current status.
+Meridian is a research prototype. TLS, node identity verification, client authentication and WAL encryption are designed but **not yet implemented**; the scope above describes the target system. See the [project status table](README.md#project-status) for what exists today.
 
 **The chaos suite is destructive and runs in an isolated Docker network. Do not run `make chaos-run` against any real infrastructure. Do not connect a Meridian cluster to systems storing sensitive data until a stable release is tagged.**
