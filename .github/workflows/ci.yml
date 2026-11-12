@@ -80,6 +80,16 @@ jobs:
         with:
           toolchain: "1.87"
 
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+
+      - name: Generate protobuf
+        run: make proto
+
       - name: Test Go to Rust storage boundary
         run: |
           make test-storage-ffi
