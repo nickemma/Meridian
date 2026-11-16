@@ -12,7 +12,7 @@ import (
 	"os"
 	"sort"
 
-	"github.com/nickemma/meridian/internal/consistency"
+	consistency "github.com/nickemma/meridian/internal/consistency/domain"
 )
 
 type record struct {

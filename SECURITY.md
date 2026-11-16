@@ -30,6 +30,6 @@ Out of scope: theoretical attacks without proof-of-concept, performance issues, 
 
 ## Current Status
 
-Meridian is a research prototype. TLS, node identity verification, client authentication and WAL encryption are designed but **not yet implemented**; the scope above describes the target system. See the [project status table](README.md#project-status) for what exists today.
+Meridian is a research prototype. Optional mutual TLS, node/client identity verification, tenant namespace authorization and read/write permissions are implemented and tested. Plaintext remains an isolated-development mode. Automated certificate lifecycle, WAL encryption, tenant resource quotas and Byzantine fault tolerance are not implemented; the scope above includes target behavior. See [the storage threat model](docs/threat-model.md) and [the end-to-end walkthrough](docs/walkthrough.md) for exact assumptions, tests and limitations. See the [project status table](README.md#project-status) for what exists today.
 
 **The chaos suite is destructive and runs in an isolated Docker network. Do not run `make chaos-run` against any real infrastructure. Do not connect a Meridian cluster to systems storing sensitive data until a stable release is tagged.**

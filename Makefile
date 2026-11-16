@@ -2,26 +2,26 @@
 
 # Build the main node binary
 build:
-	go build -o bin/meridian ./cmd/meridian
+	go build -buildvcs=false -o bin/meridian ./cmd/meridian
 
 # Build a runnable node linked to the Rust LSM state machine.
 build-storageffi: storage-build
-	go build -tags storageffi -o bin/meridian ./cmd/meridian
+	go build -buildvcs=false -tags storageffi -o bin/meridian ./cmd/meridian
 
 # Build the development workload driver and bounded history checker.
 build-load:
-	go build -o bin/meridian-load ./cmd/meridian-load
+	go build -buildvcs=false -o bin/meridian-load ./cmd/meridian-load
 
 # Build the open-loop driver used for latency-under-offered-load trials.
 build-openload:
-	go build -o bin/meridian-openload ./cmd/meridian-openload
+	go build -buildvcs=false -o bin/meridian-openload ./cmd/meridian-openload
 
 build-check:
-	go build -o bin/meridian-check ./cmd/meridian-check
+	go build -buildvcs=false -o bin/meridian-check ./cmd/meridian-check
 
 # Build the conservative client-observable staleness analyzer.
 build-staleness:
-	go build -o bin/meridian-staleness ./cmd/meridian-staleness
+	go build -buildvcs=false -o bin/meridian-staleness ./cmd/meridian-staleness
 
 # Verify a small successful strong-operation history emitted by meridian-load.
 # Usage: make check-history HISTORY=results/trial-1.jsonl
@@ -33,22 +33,27 @@ check-history:
 run:
 	go run ./cmd/meridian
 
+# Enforce domain <- ports <- application <- adapters inside internal/.
+.PHONY: check-layers
+check-layers:
+	python3 scripts/check-layers.py
+
 # Run all tests
 test:
 	go test ./... -v -race
 
 # Build the Rust static library consumed by the optional Go storage adapter.
 storage-build:
-	cargo build --manifest-path storage-engine/Cargo.toml --release
+	cargo build --locked --manifest-path storage-engine/Cargo.toml --release
 
 # Run the real Go-to-Rust storage integration tests.
 test-storage-ffi: storage-build
-	go test -tags storageffi ./internal/storage -v -race
+	go test -tags storageffi ./internal/storage/... -v -race
 
 # Exercise leader election, client RPCs, Raft replication, and Rust state
 # machine application in one live three-node process test.
 test-strong-integration: storage-build
-	go test -tags storageffi ./internal/server -v -race -run TestStrongKVOverLiveThreeNodeCluster
+	go test -tags storageffi ./internal/server/... -v -race -run TestStrongKVOverLiveThreeNodeCluster
 
 # Generate Go code from all .proto file
 proto:
@@ -87,3 +92,18 @@ chaos-run:
 # Clean built binaries
 clean:
 	rm -rf bin/
+
+# Storage-focused review tools; no GPU, Docker or elevated network privileges.
+.PHONY: build-tools test-security storage-lab
+build-tools:
+	go build -buildvcs=false -o bin/meridianctl ./cmd/meridianctl
+	go build -buildvcs=false -o bin/meridian-pki ./cmd/meridian-pki
+	go build -buildvcs=false -o bin/meridian-lab ./cmd/meridian-lab
+
+test-security:
+	go test -race ./internal/security/... ./internal/observability/...
+
+# OUT must not already exist. Artifacts are retained; child nodes are cleaned up.
+storage-lab: build-storageffi build-tools
+	@test -n "$(OUT)" || (echo "OUT must name a new artifact directory" >&2; exit 2)
+	bin/meridian-lab -out "$(OUT)"

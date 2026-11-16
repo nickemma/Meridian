@@ -24,8 +24,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
-          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.1
 
       - name: Generate protobuf
         run: make proto
@@ -84,8 +84,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
-          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.1
 
       - name: Generate protobuf
         run: make proto
@@ -94,3 +94,22 @@ jobs:
         run: |
           make test-storage-ffi
           make test-strong-integration
+
+      - name: Reproduce secure storage fault trial
+        run: |
+          make build-storageffi build-tools
+          mkdir -p results
+          bin/meridian-lab -out results/ci-storage-trial
+
+      - name: Retain sanitized storage evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-fault-evidence
+          path: |
+            results/ci-storage-trial/summary.json
+            results/ci-storage-trial/environment.json
+            results/ci-storage-trial/timeline.jsonl
+            results/ci-storage-trial/*.log
+            results/ci-storage-trial/*-metrics.txt
+          if-no-files-found: warn

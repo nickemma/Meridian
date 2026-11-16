@@ -11,7 +11,7 @@
 
 **A geo-distributed key-value store in which the replication mechanism is chosen per request — Raft for strong, vector-clock dependency tracking for causal, asynchronous gossip for eventual — over one keyspace and one storage engine.**
 
-[Project status](#project-status) • [Research protocol](docs/research.md) • [API and run guide](API.md) • [Roadmap](docs/ROADMAP.md)
+[Project status](#project-status) • [Research protocol](docs/research.md) • [API reference](API.md) • [Walkthrough](docs/walkthrough.md) • [Roadmap](docs/ROADMAP.md)
 
 </div>
 
@@ -52,7 +52,8 @@ Every component is listed with its real state. Vocabulary: **Working** · **Part
 | Eventual path | **Working** — multi-value registers, immediate async push, 250 ms anti-entropy retransmit; concurrent siblings returned to the client |
 | Cross-mechanism contract | **Partial** — one write class per namespace is enforced and strong writes are materialized for weak reads; namespace policies are fixed at startup (not Raft-installed) and there is no durable gossip outbox |
 | Client API (`Get` / `Put` / `Delete` / `CompareAndSet` / `Status`) and leader-aware Go client | **Working** |
-| Inter-node TLS / authentication | Designed, not built — peer gRPC is currently plaintext |
+| TLS / authentication / authorization | **Working in opt-in secure mode** — mTLS on both listeners, explicit peer/client identities, certificate-bound Raft senders and tenant read/write permissions; automated certificate lifecycle remains open |
+| Tenant namespaces | **Working in secure mode** — client identities map to `/tenants/<id>/` namespaces; Get/Put/Delete/CAS permissions enforced before handlers |
 
 ### Verification and measurement tooling
 
@@ -63,9 +64,10 @@ Every component is listed with its real state. Vocabulary: **Working** · **Part
 | Open-loop driver (`cmd/meridian-openload`) | **Working** — schedules the pre-registered mixed workload at a target offered rate |
 | Staleness analysis (`cmd/meridian-staleness`) | **Partial** — lower-bound staleness from histories; no acknowledgement-to-visibility measure |
 | Chaos suite (`chaos/`) | **Partial** — node kill, partition and clock-skew scenarios against the Docker cluster; no retained runs |
-| Prometheus metrics | **Working** — 17 metrics per node on `client port + 1000`; Grafana is an optional Compose profile with no provisioned dashboards |
+| Prometheus metrics | **Working** — request/error/latency, dependency waits/backlog, gossip outcomes and Raft peer/apply lag on `client port + 1000`; Grafana is optional with no provisioned dashboards |
 | External baselines (etcd, Cassandra) | **Partial** — reference deployments start; no measurements |
-| Evaluation (research questions Q1–Q3) | Not run |
+| Reproducible storage fault trial | **Working** — authenticated three-process Rust-backed trial; tenant denials, leader kill/restart, replication partition/heal, quorum loss/recovery, JSONL timeline and phase metrics |
+| Evaluation (research questions Q1–Q3) | Not run — the functional fault trial is not a performance evaluation |
 
 ### Secrets and policy layer
 
@@ -82,6 +84,19 @@ These packages exist with unit tests but are **not yet mounted on the running no
 
 ---
 
+## Storage security and reproducible fault tests
+
+Meridian remains a distributed-storage prototype. The [storage evolution plan](plan.md) adds tenant-scoped access controls, optional mutual TLS and storage/replication observability. The [end-to-end walkthrough](docs/walkthrough.md) includes a secure local cluster, a storage CLI and a fixed fault trial that retains assertions, logs and metrics. The [storage threat model](docs/threat-model.md) states the tested guarantees and limitations.
+
+```bash
+make proto
+make build-storageffi build-tools
+mkdir -p results
+bin/meridian-lab -out results/trial-1
+```
+
+See [`docs/walkthrough.md`](docs/walkthrough.md) for prerequisites and pinned protobuf generators. Expected: `passed: true`; deliberate authorization denials and quorum/dependency timeouts are part of the checks. Exact timings and leader choices vary. Secure mode is opt-in; the original Compose configuration is still a plaintext development deployment.
+
 ## What testing has found
 
 Building the live three-node leader-failover test exposed three Raft defects that unit tests had not:
@@ -89,6 +104,8 @@ Building the live three-node leader-failover test exposed three Raft defects tha
 1. **Concurrent vote handlers could grant two votes in one term** — a safety violation that can elect two leaders. State-changing Raft RPCs are now serialized (`TestHandleRequestVoteGrantsAtMostOneVotePerTerm`).
 2. **Overlapping replication rounds could transiently separate a follower's commit index from its log.** Replicated suffixes are now merged atomically.
 3. **A heartbeat could acknowledge an unrelated follower suffix.** The leader now counts only the prefix confirmed by an `AppendEntries` request.
+
+The new partition experiment also exposed and fixed two further defects: committing an unconfirmed follower suffix, and skipping a conflicting suffix replacement when its length stayed the same. Both have dedicated regression tests, including durable reopen verification.
 
 Each has a regression test. Details: [`docs/research.md` §5.5](docs/research.md#55-september-11-implementation-update).
 
@@ -140,7 +157,7 @@ make chaos-run
 make cluster-down
 ```
 
-[`API.md`](API.md) has the full run guide: finding the leader, namespace policies, the gRPC contract, a Go client example, error handling and the open-loop research driver.
+[`API.md`](API.md) is the client contract: RPCs, namespace policies, the causal-context guarantees, errors and metrics. [`docs/walkthrough.md`](docs/walkthrough.md) is the step-by-step run guide.
 
 ---
 
@@ -154,12 +171,15 @@ meridian/
 │  ├─ meridian-openload/   open-loop driver for the pre-registered workload
 │  ├─ meridian-check/      bounded linearizability checker
 │  └─ meridian-staleness/  staleness analysis over histories
-├─ internal/
+├─ internal/               one directory per module, each split into four layers:
+│  │                         domain/ (pure rules) ← ports/ (interfaces) ←
+│  │                         application/ (use cases) ← adapters/ (gRPC, disk, TLS, Prometheus)
 │  ├─ raft/                consensus, pre-vote, durable state
-│  ├─ consistency/         per-request class selection and admission
+│  ├─ consistency/         classes, namespace policies, version vectors (shared kernel)
 │  ├─ causal/  eventual/   weak-path replicas
-│  ├─ server/              client and peer gRPC services, Rust-backed state machine
-│  ├─ storage/  replicationstore/  config/  metrics/
+│  ├─ server/              KV use cases; adapters/ is the node's composition root
+│  ├─ security/            mTLS identities, tenant authorization
+│  ├─ storage/  replicationstore/  config/  metrics/  observability/  experiment/
 │  └─ secrets/  policy/  audit/  anomaly/   secrets layer — not yet mounted
 ├─ storage-engine/         Rust LSM engine and C ABI
 ├─ client/                 leader-aware Go client
@@ -178,7 +198,8 @@ meridian/
 |---|---|
 | [`docs/research.md`](docs/research.md) | Pre-registered research protocol: questions, cross-mechanism contract, hypotheses, baselines, gates |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Code status per area and what is missing before any research claim |
-| [`API.md`](API.md) | Run guide, gRPC contract, client example, current limits |
+| [`API.md`](API.md) | Client API reference: RPCs, consistency and context contract, errors, metrics, configuration |
+| [`docs/walkthrough.md`](docs/walkthrough.md) | Copy/paste setup, tests, automated fault lab, manual secure cluster, troubleshooting |
 | [`docs/DESIGN_DOC.md`](docs/DESIGN_DOC.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/TRADEOFFS.md`](docs/TRADEOFFS.md) | Design documents for the target system, written April 2026; they describe components that are not yet built |
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Operating procedures |
 
@@ -187,7 +208,7 @@ meridian/
 ## Non-goals
 
 - **Not a general-purpose database.** The consistency options exist to study their composition.
-- **Not production software.** No TLS, authentication, backup or recovery procedure yet.
+- **Not production software.** Secure mode is opt-in. Automated certificate rotation/revocation, at-rest encryption, backup and operational recovery remain open.
 - **Not highly available under quorum loss on the strong path.** Strong requests fail closed by design; weak paths keep serving with their weaker contracts.
 
 ---

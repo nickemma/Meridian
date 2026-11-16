@@ -7,16 +7,18 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/nickemma/meridian/internal/config"
-	"github.com/nickemma/meridian/internal/metrics"
-	"github.com/nickemma/meridian/internal/server"
+	config "github.com/nickemma/meridian/internal/config/adapters"
+	metricsadapters "github.com/nickemma/meridian/internal/metrics/adapters"
+	metrics "github.com/nickemma/meridian/internal/metrics/application"
+	observability "github.com/nickemma/meridian/internal/observability/adapters"
+	server "github.com/nickemma/meridian/internal/server/adapters"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 func main() {
-	// Load config from environment variables.
-	// If any required variable is missing, this exits immediately with a clear error.
-
-	cfg, err := config.Load()
+	// Load config from environment variables. A missing or malformed
+	// required variable stops the node with a clear error.
+	cfg, err := config.LoadFromEnvironment()
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
@@ -30,11 +32,9 @@ func main() {
 		os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Start metrics server on ClientPort+1000
-	// e.g. if client port is 8080, metrics is on 9080
-	metricsPort := cfg.ClientPort + 1000
-	m := metrics.New(cfg.NodeID)
-	metricsSrv := metrics.NewServer(metricsPort)
+	// Metrics are served on ClientPort+1000, e.g. client 8080 → metrics 9080.
+	m := metricsadapters.New(cfg.NodeID)
+	metricsSrv := metricsadapters.NewServer(cfg.MetricsPort())
 	go func() {
 		if err := metricsSrv.Start(ctx); err != nil {
 			log.Printf("[main] metrics server error: %v", err)
@@ -46,7 +46,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("create server: %v", err)
 	}
-	srv.RaftNode().SetMetrics(m)
+	srv.RaftNode().SetMetrics(metrics.NewRaftRecorder(m))
+	srv.SetObserver(observability.New(cfg.NodeID, prometheus.DefaultRegisterer, srv.PendingDependencies, srv.ApplyGap))
 
 	if err := srv.Start(ctx); err != nil {
 		log.Fatalf("server error: %v", err)

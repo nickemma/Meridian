@@ -4,6 +4,10 @@
 **Baseline:** `7db514c40c07fce68aa0794551830fd51a9224fd`, audited September 10, 2026; this roadmap reflects the September 11 working tree.<br>
 **Purpose:** Build Meridian from separately tested components into a verifiable mixed-consistency key-value store, then layer the secrets platform on top. This document describes code status, implementation order, and completion criteria. [`research.md`](research.md) defines the research semantics and evidence required for Q1–Q3.
 
+## November 15, 2026 storage-focused additions
+
+[plan.md](../plan.md) tracks the agreed storage evolution. Opt-in secure mode now authenticates both RPC listeners, separates tenant keyspaces and enforces read/write permissions. Storage request/replication metrics and a Rust-backed process fault trial are implemented; [the walkthrough](walkthrough.md) reproduces the manual and automated flows; [API.md](../API.md) is the client contract. The partition trial exposed and fixed unconfirmed-suffix commit and same-length conflict-replacement defects. The original Q1–Q3 correctness and measurement gates remain separate and open.
+
 ## Current State
 
 | Area | Current code | Missing before research claims |
@@ -203,7 +207,8 @@ Track B begins after Phase 3 supplies a durable strong state machine. It does no
 
 ### Phase 10 — Security and policy hardening
 
-- [ ] Add mTLS for node-to-node and client-to-node connections, certificate provisioning, node identity checks, and rotation procedures.
+- [x] Add opt-in node/client mTLS, explicit workload identities, tenant read/write authorization, and a local development certificate generator.
+- [ ] Add production certificate issuance, rotation, revocation, trust reload and connection draining.
 - [ ] Encrypt storage at rest with a managed key lifecycle; do not describe checksum-protected WAL data as encrypted.
 - [ ] Replace native policy evaluation with a WASM sandbox, explicit resource limits, deterministic inputs, and a safe fallback behavior.
 - [ ] Persist policy versions and rollbacks through Raft.

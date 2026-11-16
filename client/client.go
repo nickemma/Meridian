@@ -11,6 +11,7 @@ import (
 
 	kv "github.com/nickemma/meridian/proto/kv"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
@@ -18,12 +19,21 @@ import (
 // data mutation after an unavailable response because the server has no durable
 // request de-duplication yet; callers must decide whether retry is safe.
 type Client struct {
-	targets []string
-	mu      sync.Mutex
-	conns   map[string]*grpc.ClientConn
+	transport credentials.TransportCredentials
+	targets   []string
+	mu        sync.Mutex
+	conns     map[string]*grpc.ClientConn
 }
 
 func New(targets []string) (*Client, error) {
+	return NewWithCredentials(targets, insecure.NewCredentials())
+}
+
+// NewWithCredentials secures every connection, including leader discovery.
+func NewWithCredentials(targets []string, transport credentials.TransportCredentials) (*Client, error) {
+	if transport == nil {
+		return nil, fmt.Errorf("transport credentials are required")
+	}
 	if len(targets) == 0 {
 		return nil, fmt.Errorf("at least one Meridian target is required")
 	}
@@ -38,7 +48,7 @@ func New(targets []string) (*Client, error) {
 			copyTargets = append(copyTargets, target)
 		}
 	}
-	return &Client{targets: copyTargets, conns: make(map[string]*grpc.ClientConn)}, nil
+	return &Client{transport: transport, targets: copyTargets, conns: make(map[string]*grpc.ClientConn)}, nil
 }
 
 func (c *Client) Close() error {
@@ -126,7 +136,7 @@ func (c *Client) service(target string) (kv.KVServiceClient, error) {
 	connection := c.conns[target]
 	if connection == nil {
 		var err error
-		connection, err = grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		connection, err = grpc.NewClient(target, grpc.WithTransportCredentials(c.transport.Clone()))
 		if err != nil {
 			return nil, fmt.Errorf("connect to %s: %w", target, err)
 		}
@@ -140,4 +150,13 @@ func statusContext(parent context.Context) (context.Context, context.CancelFunc)
 		return context.WithDeadline(parent, deadline)
 	}
 	return context.WithTimeout(parent, 500*time.Millisecond)
+}
+
+// Status queries the first configured node; it does not discover a leader.
+func (c *Client) Status(ctx context.Context) (*kv.StatusResponse, error) {
+	service, err := c.service(c.targets[0])
+	if err != nil {
+		return nil, err
+	}
+	return service.Status(ctx, &kv.StatusRequest{})
 }

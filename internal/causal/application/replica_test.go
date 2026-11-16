@@ -1,0 +1,252 @@
+package application
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/nickemma/meridian/internal/causal/domain"
+	consistency "github.com/nickemma/meridian/internal/consistency/domain"
+)
+
+type memorySnapshotStore struct{ snapshot []byte }
+
+func (s *memorySnapshotStore) LoadSnapshot() ([]byte, error) {
+	return append([]byte(nil), s.snapshot...), nil
+}
+func (s *memorySnapshotStore) SaveSnapshot(snapshot []byte) error {
+	s.snapshot = append([]byte(nil), snapshot...)
+	return nil
+}
+
+func TestReplicaHoldsReorderedRecordUntilDependencyArrives(t *testing.T) {
+	origin, err := NewReplica("origin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := origin.Write([]byte("/causal/a"), []byte("one"), false, nil, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := origin.Write([]byte("/causal/b"), []byte("two"), false, first.Version, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target, err := NewReplica("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, err := target.Receive(second)
+	if err != nil || applied {
+		t.Fatalf("Receive(second) = (%v, %v), want (false, nil)", applied, err)
+	}
+	if target.Pending() != 1 {
+		t.Fatalf("pending = %d, want 1", target.Pending())
+	}
+	applied, err = target.Receive(first)
+	if err != nil || !applied {
+		t.Fatalf("Receive(first) = (%v, %v), want (true, nil)", applied, err)
+	}
+	got, err := target.Read([]byte("/causal/b"), second.Version, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Values) != 1 || string(got.Values[0].Value) != "two" || target.Pending() != 0 {
+		t.Fatalf("applied record = %#v, pending = %d", got.Values, target.Pending())
+	}
+}
+
+func TestReplicaConvergesWithReorderedDuplicateDependencyChain(t *testing.T) {
+	origin, err := NewReplica("origin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := origin.Write([]byte("/causal/a"), []byte("one"), false, nil, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := origin.Write([]byte("/causal/b"), []byte("two"), false, first.Version, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := origin.Write([]byte("/causal/c"), []byte("three"), false, second.Version, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target, err := NewReplica("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range []consistency.Record{third, second, third, first, second, first} {
+		if _, err := target.Receive(record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, key := range [][]byte{[]byte("/causal/a"), []byte("/causal/b"), []byte("/causal/c")} {
+		got, err := target.Read(key, nil, 0)
+		if err != nil || len(got.Values) != 1 {
+			t.Fatalf("Read(%q) = (%#v, %v)", key, got, err)
+		}
+	}
+	if target.Pending() != 0 {
+		t.Fatalf("pending records = %d, want 0", target.Pending())
+	}
+}
+
+func TestReplicaEnforcesClientAndRaftDependencies(t *testing.T) {
+	replica, err := NewReplica("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	missing := consistency.VersionVector{"other": 1}
+	if _, err := replica.Write([]byte("/causal/k"), []byte("v"), false, missing, 0, 1); !errors.Is(err, domain.ErrUnsatisfiedDependencies) {
+		t.Fatalf("Write missing vector dependency error = %v", err)
+	}
+	if _, err := replica.Write([]byte("/causal/k"), []byte("v"), false, nil, 4, 1); !errors.Is(err, domain.ErrUnsatisfiedDependencies) {
+		t.Fatalf("Write missing Raft dependency error = %v", err)
+	}
+	replica.ObserveRaft(4)
+	record, err := replica.Write([]byte("/causal/k"), []byte("v"), false, nil, 4, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.RaftIndex != 4 {
+		t.Fatalf("RaftIndex = %d, want 4", record.RaftIndex)
+	}
+}
+
+func TestReadContextWaitsForRaftDependencyOrDeadline(t *testing.T) {
+	replica, err := NewReplica("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := replica.ReadContext(deadline, []byte("/strong/k"), nil, 1); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ReadContext missing dependency error = %v, want deadline exceeded", err)
+	}
+
+	ready, cancelReady := context.WithTimeout(context.Background(), time.Second)
+	defer cancelReady()
+	result := make(chan error, 1)
+	go func() {
+		_, err := replica.ReadContext(ready, []byte("/strong/k"), nil, 2)
+		result <- err
+	}()
+	time.Sleep(5 * time.Millisecond)
+	if err := replica.ObserveRaft(2); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; err != nil {
+		t.Fatalf("ReadContext did not unblock after Raft apply: %v", err)
+	}
+}
+
+func TestReplicaKeepsConcurrentValuesAndIsIdempotent(t *testing.T) {
+	left, err := NewReplica("left")
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := NewReplica("right")
+	if err != nil {
+		t.Fatal(err)
+	}
+	leftWrite, err := left.Write([]byte("/causal/k"), []byte("left"), false, nil, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightWrite, err := right.Write([]byte("/causal/k"), []byte("right"), false, nil, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := NewReplica("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range []consistency.Record{leftWrite, rightWrite, leftWrite} {
+		if _, err := target.Receive(record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := target.Read([]byte("/causal/k"), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Values) != 2 {
+		t.Fatalf("values = %#v, want two concurrent siblings", got.Values)
+	}
+}
+
+func TestReplicaDoesNotTreatCausalReceiptAsStrongApplication(t *testing.T) {
+	replica, err := NewReplica("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := consistency.Record{
+		Key:          []byte("/causal/k"),
+		Value:        []byte("v"),
+		Version:      consistency.VersionVector{"origin": 1},
+		Dependencies: consistency.VersionVector{},
+		Origin:       "origin",
+		RaftIndex:    7,
+	}
+	applied, err := replica.Receive(record)
+	if err != nil || applied {
+		t.Fatalf("Receive = (%v, %v), want held by Raft watermark", applied, err)
+	}
+	replica.ObserveRaft(6)
+	if replica.Pending() != 1 {
+		t.Fatalf("record released before local Raft apply")
+	}
+	replica.ObserveRaft(7)
+	if replica.Pending() != 0 {
+		t.Fatalf("record not released after local Raft apply")
+	}
+}
+
+func TestOpenReplicaRestoresRecordsAndRaftWatermark(t *testing.T) {
+	store := &memorySnapshotStore{}
+	first, err := OpenReplica("a", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.ObserveRaft(5); err != nil {
+		t.Fatal(err)
+	}
+	record, err := first.Write([]byte("/causal/k"), []byte("v"), false, nil, 5, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := OpenReplica("a", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := restarted.Read([]byte("/causal/k"), record.Version, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Values) != 1 || string(got.Values[0].Value) != "v" || got.AppliedRaftIdx != 5 {
+		t.Fatalf("restored snapshot = %#v", got)
+	}
+}
+
+type failingSnapshotStore struct{ memorySnapshotStore }
+
+func (failingSnapshotStore) SaveSnapshot([]byte) error { return errors.New("disk full") }
+
+func TestFailedCheckpointLeavesStateUnchanged(t *testing.T) {
+	replica, err := OpenReplica("node-1", &failingSnapshotStore{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := replica.Write([]byte("/causal/k"), []byte("v"), false, nil, 0, 1); err == nil {
+		t.Fatal("write acknowledged without a durable checkpoint")
+	}
+	got, err := replica.Read([]byte("/causal/k"), nil, 0)
+	if err != nil || len(got.Values) != 0 || len(got.Frontier) != 0 {
+		t.Fatalf("state advanced after failed checkpoint: %+v, %v", got, err)
+	}
+}

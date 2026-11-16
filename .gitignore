@@ -18,3 +18,7 @@ __pycache__/
 
 # Rust
 target/
+
+# Local certificates, storage experiments and retained private artifacts
+.meridian/
+results/

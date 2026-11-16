@@ -207,6 +207,14 @@ Nothing else in the protocol changes. The research questions (§2), the cross-me
 
 Gate status at this amendment is recorded in a second column of the Appendix A table, separately from the original audited status, so the two can be compared.
 
+### 5.8 November 15, 2026 storage security and fault-testing update
+
+The storage prototype now includes opt-in mutual TLS for client and peer RPCs, explicit tenant read/write permissions, certificate-bound Raft sender checks, and request/replication metrics. A fixed local trial starts three Rust-backed node processes, tests tenant denials and all three data paths, kills/restarts a leader, cuts/heals replication links, removes/restores quorum, and records a JSONL timeline plus phase metrics. [the walkthrough](walkthrough.md) provides the reproducible procedure and [API.md](../API.md) the client contract and [the threat model](threat-model.md) states its limits.
+
+The partition trial exposed two additional Raft defects. A follower could commit a divergent suffix beyond the prefix confirmed by a heartbeat; commit advancement is now bounded by that request's confirmed index. A conflicting suffix replacement of the same length could be discarded as a no-op; merge now tracks content changes and persists them. Both new regression tests failed before their fixes and pass afterward, including a durable reopen check.
+
+The §4.4 cross-mechanism contract is unchanged: namespace policies still admit exactly one write class, strong versions are materialized for weaker reads, and causal dependencies must be locally satisfied. Tenant namespaces add admission boundaries around this contract. This functional trial is not a complete linearizability analysis or the retained Q1–Q3 evaluation; none of the original performance gates is marked complete. Future experiments must record transport/authentication configuration and account for instrumentation costs.
+
 ## 6. Evaluation Protocol
 
 ### 6.1 Questions, hypotheses, and decision rules

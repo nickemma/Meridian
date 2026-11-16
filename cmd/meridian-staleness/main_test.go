@@ -4,7 +4,7 @@ import (
 	"encoding/base64"
 	"testing"
 
-	"github.com/nickemma/meridian/internal/consistency"
+	consistency "github.com/nickemma/meridian/internal/consistency/domain"
 )
 
 func TestAnalyzeIdentifiesStaleStrongRead(t *testing.T) {
