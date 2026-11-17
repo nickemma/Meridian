@@ -60,9 +60,25 @@ func (t *ElectionTimer) Reset() {
 	}
 }
 
-// Stop permanently disables the timer.
-// Called when the node shuts down or becomes leader
-// (leaders use a heartbeat ticker, not an election timer).
+// Pause halts the countdown while this node is leader (leaders use a
+// heartbeat ticker instead). Unlike Stop it is not permanent: the next Reset,
+// issued when the leader steps down, re-arms the timer. A deposed leader must
+// be able to campaign again, or a majority that contains it can stay
+// leaderless forever.
+func (t *ElectionTimer) Pause() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.timer != nil {
+		t.timer.Stop()
+	}
+	// Discard a fire that was already queued for the old countdown.
+	select {
+	case <-t.firedCh:
+	default:
+	}
+}
+
+// Stop permanently disables the timer. Called only when the node shuts down.
 func (t *ElectionTimer) Stop() {
 	t.mu.Lock()
 	defer t.mu.Unlock()

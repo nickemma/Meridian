@@ -78,3 +78,21 @@ func TestElectionTimer_FiresAgainAfterReset(t *testing.T) {
 		t.Fatal("timer did not fire second time after reset")
 	}
 }
+
+func TestElectionTimer_ResetAfterPauseFiresAgain(t *testing.T) {
+	timer := NewElectionTimer(20*time.Millisecond, 40*time.Millisecond)
+	defer timer.Stop()
+	timer.Reset()
+	timer.Pause()
+	select {
+	case <-timer.Fired():
+		t.Fatal("paused timer fired")
+	case <-time.After(100 * time.Millisecond):
+	}
+	timer.Reset()
+	select {
+	case <-timer.Fired():
+	case <-time.After(time.Second):
+		t.Fatal("timer did not fire after Reset following Pause")
+	}
+}

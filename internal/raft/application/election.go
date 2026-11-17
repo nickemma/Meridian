@@ -143,8 +143,9 @@ func (n *Node) runElection() {
 
 			n.state.BecomeLeader(n.peerIDs())
 
-			// Stop the election timer — leaders use a heartbeat ticker.
-			n.electionTimer.Stop()
+			// Pause the election timer — leaders use a heartbeat ticker. Stepping
+			// down later re-arms it through Reset.
+			n.electionTimer.Pause()
 
 			// Start sending heartbeats immediately.
 			go n.runHeartbeat()
