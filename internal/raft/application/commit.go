@@ -115,6 +115,6 @@ func (n *Node) applyCommitted() {
 			log.Printf("[raft] %s failed to persist last applied %d: %v", n.state.NodeID(), lastApplied, err)
 			return
 		}
-		n.completeApply(lastApplied, nil)
+		n.completeApply(entry, nil)
 	}
 }

@@ -35,9 +35,18 @@ type Node struct {
 	// replicationMu prevents overlapping heartbeat and client-triggered rounds
 	// from sending older log prefixes after newer ones to the same follower.
 	replicationMu sync.Mutex
-	applyWaiters  map[uint64]chan error
+	applyWaiters  map[uint64]applyWaiter
 	stopCh        chan struct{}
 	stopOnce      sync.Once
+}
+
+// applyWaiter is a client waiting for its command to be applied. The term
+// identifies the command's own entry: by the Log Matching property, a
+// different term at the same index means the command was overwritten by
+// another leader and was never committed.
+type applyWaiter struct {
+	term   uint64
+	result chan error
 }
 
 // NewNode creates a node whose committed entries are applied to stateMachine
@@ -55,7 +64,7 @@ func NewNode(opts domain.Options, state *State, peers []ports.Peer, stateMachine
 		opts:          opts,
 		commitCh:      make(chan uint64, 64),
 		stateMachine:  stateMachine,
-		applyWaiters:  make(map[uint64]chan error),
+		applyWaiters:  make(map[uint64]applyWaiter),
 		stopCh:        make(chan struct{}),
 	}
 }
@@ -200,7 +209,7 @@ func (n *Node) submit(command []byte, waiter chan error) (uint64, error) {
 	}
 	if waiter != nil {
 		n.applyMu.Lock()
-		n.applyWaiters[entry.Index] = waiter
+		n.applyWaiters[entry.Index] = applyWaiter{term: entry.Term, result: waiter}
 		n.applyMu.Unlock()
 	}
 	log.Printf("[raft] %s accepted command at index %d", n.state.NodeID(), entry.Index)
@@ -226,22 +235,29 @@ func (n *Node) notifyApply(index uint64) {
 	}
 }
 
-func (n *Node) completeApply(index uint64, result error) {
+// completeApply wakes the client waiting on entry's index. A waiter whose
+// command was superseded at that index is told so instead of being told its
+// command committed.
+func (n *Node) completeApply(entry domain.LogEntry, result error) {
 	n.applyMu.Lock()
-	waiter, ok := n.applyWaiters[index]
+	waiter, ok := n.applyWaiters[entry.Index]
 	if ok {
-		delete(n.applyWaiters, index)
+		delete(n.applyWaiters, entry.Index)
 	}
 	n.applyMu.Unlock()
-	if ok {
-		waiter <- result
+	if !ok {
+		return
 	}
+	if waiter.term != entry.Term {
+		result = fmt.Errorf("%w: index %d holds a term-%d entry, not the term-%d command", domain.ErrCommandSuperseded, entry.Index, entry.Term, waiter.term)
+	}
+	waiter.result <- result
 }
 
 func (n *Node) removeApplyWaiter(index uint64, target chan error) {
 	n.applyMu.Lock()
 	defer n.applyMu.Unlock()
-	if n.applyWaiters[index] == target {
+	if n.applyWaiters[index].result == target {
 		delete(n.applyWaiters, index)
 	}
 }

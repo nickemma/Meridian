@@ -1,5 +1,7 @@
 package domain
 
+import "errors"
+
 // The RPC messages below are transport-neutral. The gRPC adapter converts
 // them to and from protobuf; the protocol core never sees protobuf types.
 
@@ -55,3 +57,8 @@ type Status struct {
 	CommitIndex uint64
 	LastApplied uint64
 }
+
+// ErrCommandSuperseded means a submitted command's log entry was replaced by a
+// different leader's entry at the same index. The command was definitely not
+// committed and may be retried on the current leader.
+var ErrCommandSuperseded = errors.New("command was superseded by another leader's entry and was not committed")
