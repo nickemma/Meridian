@@ -70,7 +70,10 @@ func (t *trial) rpc(name string, f func(context.Context) error) error {
 	return err
 }
 
-// leader waits for one of nodes to report Leader twice, 300ms apart.
+// leader waits for one of nodes to report Leader twice, 300ms apart, and
+// then to prove it holds a quorum. Role alone is not enough: a leader cut off
+// from the majority keeps reporting Leader until it hears a higher term, and
+// returning it would race the election that replaces it.
 func (t *trial) leader(nodes []int) (int, error) {
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) && t.ctx.Err() == nil {
@@ -86,7 +89,14 @@ func (t *trial) leader(nodes []int) (int, error) {
 			if isLeader, err = t.reportsLeader(i); err != nil {
 				return 0, err
 			}
-			if isLeader {
+			if !isLeader {
+				continue
+			}
+			hasQuorum, err := t.commitsBarrier(i)
+			if err != nil {
+				return 0, err
+			}
+			if hasQuorum {
 				return i, nil
 			}
 		}
@@ -107,6 +117,24 @@ func (t *trial) reportsLeader(node int) (bool, error) {
 	defer cancel()
 	s, err := c.Status(ctx)
 	return err == nil && s.Role == "Leader", nil
+}
+
+// leaderProbeKey is read, never written, to prove a leader can commit.
+const leaderProbeKey = "/tenants/a/strong/leader-probe"
+
+// commitsBarrier reports whether node can serve a strong read. A strong read
+// commits a Raft barrier, so success proves the node is a leader with a
+// quorum. It is readiness polling and is not recorded as a trial RPC.
+func (t *trial) commitsBarrier(node int) (bool, error) {
+	c, err := t.cluster.Client([]int{node}, tenantWriter)
+	if err != nil {
+		return false, err
+	}
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(t.ctx, time.Second)
+	defer cancel()
+	_, err = get(ctx, c, leaderProbeKey, kv.Consistency_CONSISTENCY_STRONG)
+	return err == nil, nil
 }
 
 // visible waits until every node serves value for key at class.

@@ -31,7 +31,7 @@ A tenant's keyspace is `/tenants/<tenant>/...`. The certificate identity maps to
 | Namespace confusion | Neighboring tenant prefixes, traversal forms, repeated separators, NUL and backslash keys are denied | A canonical absolute key form, exact `/tenants/<id>/` prefix, no URL decoding; permission matrix |
 | Expired local credential | An expired workload certificate is rejected at startup | X.509 validity checks; `TestExpiredLocalCredentialRejected`; new-handshake expiry follows standard TLS validation |
 | Misconfigured security | Partial TLS config, wrong local identity, duplicate identities, invalid tenant policy fail startup | Strict startup validation; `TestInvalidConfigurationFailsClosed` |
-| Fault-induced strong-data corruption | Leader crash, conflicting suffix after partition and quorum loss must preserve acknowledged strong values | Fixed Rust-backed process trial; `TestHeartbeatDoesNotCommitUnconfirmedSuffix`, `TestSameLengthConflictingSuffixIsReplacedDurably` |
+| Fault-induced strong-data corruption | Leader crash, conflicting suffix after partition and quorum loss must preserve acknowledged strong values | Fixed Rust-backed process trial; `TestHeartbeatDoesNotCommitUnconfirmedSuffix`, `TestSameLengthConflictingSuffixIsReplacedDurably`, `TestSubmitAndWaitFailsWhenEntryIsSupersededAtSameIndex` (a deposed leader must not acknowledge an overwritten write), `TestDeposedLeaderCanCampaignAgain` (liveness after leadership changes) |
 
 Tests are regression evidence for these scoped properties. They are not an independent penetration test or an exhaustive proof.
 

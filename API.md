@@ -351,9 +351,9 @@ the Go client nor `meridianctl` retries mutations.
 
 `make storage-lab` runs the fixed scenario `storage-fault-trial-v1` against
 three real node processes and fails loudly if any client-visible outcome
-differs from this table. Five consecutive runs on November 16, 2026 (Go
-1.26.6, Linux amd64, Rust-backed nodes, mutual TLS) all passed with the same
-17 recorded RPCs:
+differs from this table. Thirty consecutive runs on November 16, 2026 (Go
+1.26.6, Linux amd64, Rust-backed nodes, mutual TLS) all passed, each recording
+the same 17 RPCs with the same codes in the same order:
 
 | Phase | RPC | Expected and observed |
 |---|---|---|
@@ -375,24 +375,28 @@ storage and no minority acknowledged a strong write.
 
 The latencies are listed for completeness, not as a performance claim:
 
-| | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 |
-|---|---:|---:|---:|---:|---:|
-| p50 ms | 84.6 | 63.5 | 74.9 | 73.3 | 66.6 |
-| p95 ms | 400.5 | 401.2 | 400.3 | 401.0 | 400.4 |
-| Elapsed s | 5.9 | 5.7 | 5.3 | 5.9 | 5.5 |
+| Across 30 runs | Min | Median | Max |
+|---|---:|---:|---:|
+| p50 ms | 39.5 | 63.8 | 83.3 |
+| p95 ms | 400.2 | 400.6 | 401.1 |
+| Elapsed s | 5.1 | 5.8 | 10.7 |
 
 The p95 is the trial's own 400 ms timeout on the deliberately unacknowledgeable
 writes. It is not a tail latency of successful work. The trial is sequential,
 includes deliberate failures and excludes discovery polling. It is **not** a
 throughput benchmark and not the Q1–Q3 research evaluation.
 
-The final quorum-recovery step has a known timing race in the scenario, not in
-the storage contract. It is reproducible on the code before this layout
-change too. A just-isolated former leader can report `Leader` long enough to
-pass the stability check, then step down as the restarted majority elects a new
-leader. The final read then fails leader discovery
-(`discover Meridian leader: no target reports Leader`). Treat such a run as a
-failed run and keep its artifacts; do not relabel it.
+Repeating the trial is what exposed the last three defects. Before they were
+fixed, 3 of 15 runs failed:
+
+| Defect | Symptom | Fix and regression test |
+|---|---|---|
+| A deposed leader could acknowledge a command that a new leader had overwritten at the same log index (apply waiters were keyed by index only) | A strong write reported success but was discarded | Waiters carry the entry's term; a mismatch returns `Unavailable` (`command was superseded … not committed`). `TestSubmitAndWaitFailsWhenEntryIsSupersededAtSameIndex` |
+| Winning an election stopped the election timer permanently | A node that had once been leader never campaigned again; a majority containing it could stay leaderless | Leaders pause the timer; stepping down re-arms it. `TestDeposedLeaderCanCampaignAgain`, `TestElectionTimer_ResetAfterPauseFiresAgain` |
+| The trial chose node ports, released them, then created relays that could be assigned the same ports; it also accepted any node reporting `Leader` | A node failed to bind its port; the trial raced a leadership handover | Ports stay reserved until each node starts; a leader must commit a strong-read barrier before the trial uses it. `TestLocalClusterReservesNodePortsUntilStart` |
+
+A failed run is still evidence: keep its directory and investigate it rather
+than relabelling it.
 
 ## Fault drill
 

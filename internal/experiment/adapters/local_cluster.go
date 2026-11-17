@@ -30,6 +30,17 @@ type node struct {
 	peerPort, clientPort int
 	process              *exec.Cmd
 	data                 string
+	// reserved holds this node's peer, client and metrics ports open until the
+	// process first starts, so relays created meanwhile cannot be assigned them.
+	reserved []net.Listener
+}
+
+// release closes the node's port reservations.
+func (n *node) release() {
+	for _, l := range n.reserved {
+		_ = l.Close()
+	}
+	n.reserved = nil
 }
 
 func (n *node) metricsPort() int { return n.clientPort + configdomain.MetricsPortOffset }
@@ -53,21 +64,22 @@ func NewLocalCluster(dir, binary string) (*LocalCluster, error) {
 	if err := security.GenerateDevelopmentPKI(c.pki); err != nil {
 		return nil, err
 	}
-	used := map[int]bool{}
 	for i := range c.nodes {
-		peerPort, err := freePort()
-		for err == nil && used[peerPort] {
-			peerPort, err = freePort()
-		}
+		peer, err := reservePort()
 		if err != nil {
+			c.Close()
 			return nil, err
 		}
-		used[peerPort] = true
-		clientPort, err := clientAndMetricsPort(used)
+		client, metrics, err := reserveClientAndMetricsPorts()
 		if err != nil {
+			_ = peer.Close()
+			c.Close()
 			return nil, err
 		}
-		c.nodes[i] = &node{id: fmt.Sprintf("node-%d", i+1), peerPort: peerPort, clientPort: clientPort, data: filepath.Join(dir, fmt.Sprintf("node-%d-data", i+1))}
+		c.nodes[i] = &node{
+			id: fmt.Sprintf("node-%d", i+1), peerPort: port(peer), clientPort: port(client),
+			data: filepath.Join(dir, fmt.Sprintf("node-%d-data", i+1)), reserved: []net.Listener{peer, client, metrics},
+		}
 	}
 	for i := range c.nodes {
 		for j := range c.nodes {
@@ -85,37 +97,29 @@ func NewLocalCluster(dir, binary string) (*LocalCluster, error) {
 	return c, nil
 }
 
-func freePort() (int, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port, nil
-}
+// reservePort holds a free port open. Nodes bind every interface, so the
+// reservation does too: it then also conflicts with loopback-only relays.
+func reservePort() (net.Listener, error) { return net.Listen("tcp", ":0") }
 
-// clientAndMetricsPort finds a free client port whose metrics port
-// (client+offset) is also free, and reserves both.
-func clientAndMetricsPort(used map[int]bool) (int, error) {
+func port(l net.Listener) int { return l.Addr().(*net.TCPAddr).Port }
+
+// reserveClientAndMetricsPorts holds a free client port and its metrics port
+// (client+offset) open together.
+func reserveClientAndMetricsPorts() (client, metrics net.Listener, err error) {
 	offset := configdomain.MetricsPortOffset
 	for attempts := 0; attempts < 100; attempts++ {
-		p, err := freePort()
+		client, err = reservePort()
 		if err != nil {
-			return 0, err
+			return nil, nil, err
 		}
-		if p >= 65535-offset || used[p] || used[p+offset] {
-			continue
+		if p := port(client); p < 65535-offset {
+			if metrics, err = net.Listen("tcp", fmt.Sprintf(":%d", p+offset)); err == nil {
+				return client, metrics, nil
+			}
 		}
-		l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p+offset))
-		if err != nil {
-			continue
-		}
-		_ = l.Close()
-		used[p] = true
-		used[p+offset] = true
-		return p, nil
+		_ = client.Close()
 	}
-	return 0, fmt.Errorf("no available client/metrics ports")
+	return nil, nil, fmt.Errorf("no available client/metrics ports")
 }
 
 func (c *LocalCluster) Size() int                            { return clusterSize }
@@ -156,6 +160,7 @@ func (c *LocalCluster) Start(i int) error {
 	defer log.Close()
 	cmd := exec.Command(c.binary)
 	cmd.Env = env
+	n.release()
 	cmd.Stdout = log
 	cmd.Stderr = log
 	if err := cmd.Start(); err != nil {
@@ -253,10 +258,14 @@ func (c *LocalCluster) Environment() map[string]any {
 	return map[string]any{"nodes": nodes}
 }
 
-// Close kills every node and closes every relay.
+// Close kills every node, releases unused port reservations and closes every
+// relay.
 func (c *LocalCluster) Close() {
-	for i := range c.nodes {
-		c.Kill(i)
+	for i, n := range c.nodes {
+		if n != nil {
+			c.Kill(i)
+			n.release()
+		}
 	}
 	for i := range c.links {
 		for _, link := range c.links[i] {
