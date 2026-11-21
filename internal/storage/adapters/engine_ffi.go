@@ -4,7 +4,7 @@ package adapters
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../../storage-engine/include
-#cgo LDFLAGS: ${SRCDIR}/../../../storage-engine/target/release/libmeridian_storage.a -ldl -lm -lpthread
+#cgo LDFLAGS: ${SRCDIR}/../../../storage-engine/target/release/libmeridian_storage_cgo.a -ldl -lm -lpthread
 #include <stdlib.h>
 #include "meridian_storage.h"
 */

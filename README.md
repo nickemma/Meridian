@@ -88,6 +88,8 @@ These packages exist with unit tests but are **not yet mounted on the running no
 
 Meridian remains a distributed-storage prototype. The [storage evolution plan](plan.md) adds tenant-scoped access controls, optional mutual TLS and storage/replication observability. The [end-to-end walkthrough](docs/walkthrough.md) includes a secure local cluster, a storage CLI and a fixed fault trial that retains assertions, logs and metrics. The [storage threat model](docs/threat-model.md) states the tested guarantees and limitations.
 
+The storage FFI build requires GNU `objcopy` (the `binutils` package on Ubuntu) to prepare a native-only Rust archive for cgo.
+
 ```bash
 make proto
 make build-storageffi build-tools

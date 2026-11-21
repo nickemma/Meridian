@@ -43,8 +43,14 @@ test:
 	go test ./... -v -race
 
 # Build the Rust static library consumed by the optional Go storage adapter.
+# Rust bundles LLVM bitcode from its standard library. cgo rejects that
+# metadata, so remove it from a separate archive while retaining native code
+# and leaving Cargo's original build artifacts intact.
 storage-build:
 	cargo build --locked --manifest-path storage-engine/Cargo.toml --release
+	objcopy --remove-section=.llvmbc --remove-section=.llvmcmd \
+		storage-engine/target/release/libmeridian_storage.a \
+		storage-engine/target/release/libmeridian_storage_cgo.a
 
 # Run the real Go-to-Rust storage integration tests.
 test-storage-ffi: storage-build

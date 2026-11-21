@@ -72,7 +72,9 @@ func (n *Node) runElection() {
 		mu        sync.Mutex
 		votesWon  = 1
 		responded = 0
-		done      = make(chan struct{})
+		// Votes can arrive before the result goroutine starts waiting.
+		// Retain the notification so a fast quorum cannot be lost.
+		done = make(chan struct{}, 1)
 	)
 
 	totalPeers := len(n.peers)
